@@ -1,0 +1,3056 @@
+<!DOCTYPE html>
+<!--
+====================================================================
+  Season tracker — one file, two series.
+
+  Everything is inlined on purpose: one <style>, one <script>, and the
+  data as `window.DATA` between the "season:start" and "season:end"
+  comment sentinels (spelled out in full only where they actually mark
+  the block — Commit finds them by exact string, so this comment must
+  not repeat them). It runs from file:// and from GitHub
+  Pages, with no build step and no dependency beyond the Google Fonts
+  link above.
+
+--------------------------------------------------------------------
+  SHAPE OF THE DATA
+
+  window.DATA = {
+    <seriesKey>: {
+      label,        "NASCAR" | "V8 Supercars" — the series tab's text
+      wordmark,     ["NR", "2003"] — part two takes the accent colour
+      screensLabel, what the screenshot drop zone calls your source
+      points,       { finish: [...], dnf, bonusPerMostLaps }
+      chase,        playoff config, or null for a flat championship
+      theme,        the body[data-series="…"] skin to wear
+      visionPrompt, the per-series prompt readResults() sends
+      _todo,        notes to the maintainer; survives a Commit
+      seasons: { "2016": {...}, "2015": {...} }
+    }
+  }
+
+  A season is unchanged from the single-series build:
+    { year, schedule[], drivers[], results{}, poles{}, mostLaps{}, news{} }
+  with two optional additions on a schedule entry, `round` and
+  `roundName`, which group races into rounds for display ONLY. Scoring
+  stays one race per column.
+
+  Adding a series is a data edit: drop another key into window.DATA and
+  a tab appears. Adding a season is a data edit too: drop another year
+  into that series' `seasons`.
+
+--------------------------------------------------------------------
+  PER-SERIES CONFIG
+
+  POINTS and CHASE are no longer globals — setSeries2() aims them at
+  the active series. When `chase` is null the Chase tab is hidden and
+  the view falls back to Standings. When `bonusPerMostLaps` is 0 the
+  "led the most laps" field is taken out of the race modal; the pole
+  field stays, because both series run qualifying.
+
+  NASCAR:    black + gold Chase Grid board. 2016 + 2015. Chase intact.
+  Supercars: body[data-series="supercars"] — near-black under a hard
+             red, tighter rows, a broadcast timing-screen read rather
+             than a bracket board. 2025. Finals Series. Type and colour
+             only; no marks or logos.
+
+--------------------------------------------------------------------
+  THE TWO PLAYOFF SHAPES
+
+  One engine, two rule sets, both driven off `chase`. Every Supercars
+  behaviour is opt-in via a config key NASCAR does not set, so the
+  NASCAR path is byte-for-byte the one it always ran.
+
+                     NASCAR                Supercars
+  field locks        race 26               race 27 (Bathurst)
+  seedRule           winners first         'points' — top 10
+  field              16 -> 12 -> 8 -> 4    10 -> 7 -> 4
+  round reset        base + 3/reg. win     base + seedBonus ladder,
+                                           paid by position ENTERING
+                                           the round, so it re-seeds
+  auto-advance       win a round race      win a round race
+  cups               —                     Sprint Cup (races 1-25) and
+                                           Enduro Cup (races 26-27):
+                                           a guaranteed place plus 25
+                                           points into round one
+  decideOn           best finish at the    'points' — the four score
+                     finale                all three Adelaide races
+
+  Supercars ladders, from supercars.com: Gold Coast base 3000 with
+  150/120/96/78/66/57/48/39/30/21; Sandown base 4000 with the first
+  seven of those; Adelaide base 5000 with a 50/30/15 Grand Final bonus.
+
+  A series with `chase: null` hides the tab entirely and falls back to
+  Standings — that path still works, it just isn't used right now.
+
+  Theming is one rule: no accent colour literal outside a token block.
+  Use var(--accent) and it themes itself.
+
+--------------------------------------------------------------------
+  STORAGE — Supabase, not localStorage
+
+  Seasons live in the same Supabase project as the other apps on this
+  account, in the `predictor_state` table the Ladder Predictor already
+  uses. Every key here carries a `tracker_` prefix, so the two apps
+  share a table without touching each other's rows (LP's are `lp_`).
+
+    tracker_data    {series: {year: season}} — results only, no config
+    tracker_series  the series to open on
+    tracker_year    {series: year} — each series keeps its own year
+
+  Cloud-only by choice: the app gates on a session and will not open
+  without one, so there is a single copy of the truth and no merge to
+  get wrong. No offline use. `store` wears localStorage's interface —
+  synchronous getItem/setItem over an in-memory cache, the write
+  debounced 400ms out to Supabase — which is why the rest of the app
+  reads and writes storage exactly as it did before.
+
+  Writes still pending when the tab is hidden are flushed immediately,
+  and a close with a write outstanding is held by beforeunload. Cloud
+  errors are loud: the masthead reads "Not saved" in red and a toast
+  carries the message.
+
+  Two things stay in real localStorage, this device only:
+
+    nr2003.anthropicKey   reads your results photographs
+    nr2003.github         the repo write token
+
+  Neither ever leaves the browser it was typed into, which is what the
+  Settings copy has always promised. Enter them once per machine.
+
+  Migration runs once, on a sign-in where the account has no seasons
+  yet, and never deletes anything. It looks for tracker.data (the
+  localStorage era of this app), then nr2003.seasons (the single-series
+  build before that), lifts whichever it finds into the cloud, and says
+  so. The local copy stays put as a backup.
+
+  GitHub commit is unchanged and still writes the data block into this
+  file, so the seasons remain in version control as well.
+
+  NOTE: the Supabase library is the one script that is not inlined —
+  it comes from cdn.jsdelivr.net, the same build the other apps use.
+  That is a deliberate break from the original single-file rule, taken
+  because auth is not worth hand-rolling against the REST API.
+
+--------------------------------------------------------------------
+  EDITING A SEASON WITHOUT TOUCHING THIS FILE
+
+  "Edit season", beside the year picker, is the way in. It works on a
+  clone and commits on Save, so Cancel really cancels. Three panels:
+
+    Field     add, rename, renumber or remove drivers. A driver's id
+              is minted once from their name and then left alone, so a
+              rename carries their whole season of results with it.
+              Removing a driver who has results asks first and then
+              clears those results, their poles and their most-laps.
+
+    Calendar  add, edit or remove races, and set a race's round, round
+              name and points multiplier. Races renumber from the top
+              on Save, and results, poles, most-laps and notes all move
+              with them; a deleted race takes its own results with it.
+
+    Seasons   list, switch, delete, and add a year — empty, or copied
+              from an existing season. A copy brings the calendar and
+              the field, never the results.
+
+  Both series use it. It is the intended way to add 2026, or to fix
+  the roster, rather than hand-editing the data block.
+
+  SEASONS ARE ISOLATED. Every copy is a structuredClone and the editor
+  writes only to the season that is open, so changing a grid for one
+  year cannot reach a prior year, a later year, or the other series.
+  Leaving the editor with edits still in the working copy asks before
+  discarding them.
+
+  Per-season overrides: a season may carry its own `points` and
+  `chase`, and they beat the series defaults where present. Every
+  season made by the editor gets its own copy of both, which is what
+  makes a second year safe — a 2026 with a different calendar, table
+  and bracket cannot disturb 2025.
+
+  A bracket is configured in race numbers, so a redrawn calendar can
+  leave it pointing at races that no longer exist. chaseGaps() catches
+  that and the chase view says so in red rather than quietly scoring
+  against a bracket that cannot run.
+
+--------------------------------------------------------------------
+  RACE WEIGHTING
+
+  A schedule entry may carry `mult` — what that one race is worth
+  against the standard points table. Omitted means 1. Supercars' two
+  enduros (The Bend r26, Bathurst r27) are `mult: 2`: one long race
+  paying double. It applies to finishing points, DNF points, the chase
+  rounds and the cup slices alike, and it shows on the schedule chip,
+  the grid header and the race modal as "x2".
+
+  It lives on the schedule, not in the points config, so re-weighting a
+  race when the calendar changes is a data edit and nothing else — a
+  100km Friday sprint at a third of the points is `mult: 0.333`.
+
+  NASCAR sets no mult anywhere, so every NASCAR race is 1x and its
+  arithmetic is untouched.
+
+--------------------------------------------------------------------
+  TODO — what is left, also in DATA.supercars._todo
+
+  1. Confirm the 2025 grid. The 24-car full-season entry list is in and
+     verified, but two cars changed hands mid-season and are carried as
+     two driver rows each — #3 Love (rd 1) then Cameron (rds 2-13), #62
+     Stanaway (rds 1-11) then Ojeda (rds 12-13). A 25th car, #35
+     Cameron Crick (Matt Stone Racing), was on the season-opening entry
+     list but is not a full-season entry. All of that is now yours to
+     fix in Edit season > Field.
+
+  2. There is no per-race manual bonus field — the only manual bonus is
+     `legacyBonus` on a driver, editable in Edit season > Field, which
+     applies to both series. Say the word if you want a per-race one.
+
+  SETTLED: the per-race points table (150 down to 36 at P25, DNF 0,
+  enduros 2x); the Finals ladder re-seeding by position entering each
+  round; the cups as secondary to the championship; and the Supercars
+  vision prompt, which now expects photographs rather than clean
+  screengrabs.
+
+====================================================================
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Season</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:ital,wght@0,400;0,500;0,600;0,700;1,600;1,700&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+/* ------------------------------------------------------------------
+   Two skins, one stylesheet.
+
+   Everything the eye reads as "which series is this" goes through a
+   token. :root holds the NASCAR skin — the Chase Grid board: black,
+   gold, hard italics, chevron round badges, colour carrying meaning
+   and nothing else (gold is a win, silver is alive, red is a DNF,
+   dim is gone). body[data-series="…"] below overrides those tokens.
+
+   Rule for anything added later: no accent colour literal outside a
+   token block. Use var(--accent) and it themes itself.
+------------------------------------------------------------------ */
+
+:root {
+  --bg: #000;
+  --panel: #0b0d0e;
+  --pill: #1c1f22;
+  --pill-hi: #24282b;
+  --raised: #16191b;
+  --line: #2a2e31;
+  --line-soft: #17191b;
+  --text: #e9eaeb;
+  --muted: #8a8f93;
+  --dim: #4e5255;
+
+  --gold: #f6ce0b;
+  --gold-lo: #8a7406;
+  --silver: #b8bcc0;
+  --dnf: #a8413f;
+  --danger: #c0453f;
+
+  /* the themeable layer — every skin redefines exactly these */
+  --accent: #f6ce0b;        /* the one warm thing on the page */
+  --accent-lo: #8a7406;     /* accent, backed off — hairlines and asides */
+  --accent-hi: #ffe14a;     /* accent under the cursor */
+  --accent-ink: #000;       /* text sitting on a solid accent fill */
+  --head: #111416;          /* frozen table header */
+  --win-bg: #2e2503;        /* the wash behind a win */
+  --champ-a: #3b2f04;       /* champion slot, top */
+  --champ-b: #221b02;       /* champion slot, bottom */
+  --chrome-1: #fff6cf;      /* the chromed wordmark gradient */
+  --chrome-2: #f6ce0b;
+  --chrome-3: #7d6a05;
+  --row-h: 27px;
+
+  --mono: 'IBM Plex Mono', ui-monospace, monospace;
+  --cond: 'Barlow Semi Condensed', 'Barlow Condensed', 'Arial Narrow', sans-serif;
+  --cell: 30px;
+  --skew: -11deg;
+}
+
+/* ------------------------------------------------------------------
+   V8 Supercars — a broadcast timing screen, not a bracket board.
+   Near-black under a hard red, white text, rows pulled tighter, the
+   skew almost out of it. Type and colour only: no marks, no logos.
+------------------------------------------------------------------ */
+body[data-series="supercars"] {
+  --bg: #08090a;
+  --panel: #0e1011;
+  --pill: #191b1d;
+  --pill-hi: #212527;
+  --raised: #141719;
+  --line: #2b2f32;
+  --line-soft: #191c1e;
+  --text: #f5f6f7;
+  --muted: #979da1;
+  --dim: #545a5e;
+
+  --accent: #e2231a;
+  --accent-lo: #7c100c;
+  --accent-hi: #ff3b30;
+  --accent-ink: #fff;
+  --head: #131719;
+  --win-bg: #3a0a07;
+  --champ-a: #4a0d09;
+  --champ-b: #250504;
+  --chrome-1: #fff;
+  --chrome-2: #e2231a;
+  --chrome-3: #6d0e0a;
+
+  --cell: 28px;
+  --row-h: 24px;
+  --skew: -4deg;
+}
+
+/* timing-screen details, scoped to the skin */
+body[data-series="supercars"] .wordmark { letter-spacing: .16em; }
+body[data-series="supercars"] thead th { letter-spacing: .16em; font-style: normal; }
+body[data-series="supercars"] .race-chip { border-radius: 0; }
+body[data-series="supercars"] .race-chip.done { box-shadow: inset 2px 0 0 var(--accent); }
+body[data-series="supercars"] .c-pts { color: var(--accent); }
+body[data-series="supercars"] .season-tag { color: var(--accent); }
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--cond);
+  font-size: 16px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* the one chromed thing on the page */
+.chrome {
+  font-family: var(--cond); font-style: italic; font-weight: 700;
+  text-transform: uppercase; letter-spacing: .1em;
+  background: linear-gradient(var(--chrome-1) 8%, var(--chrome-2) 46%, var(--chrome-3) 92%);
+  -webkit-background-clip: text; background-clip: text;
+  color: transparent;
+}
+
+/* --- masthead: series switch on top, season + views under it ------ */
+
+.masthead { position: sticky; top: 0; z-index: 40; }
+
+.seriesbar {
+  display: flex; align-items: center; gap: 22px;
+  padding: 11px 22px 0;
+  background: var(--panel);
+  flex-wrap: wrap;
+}
+
+.series-tabs { display: flex; gap: 0; align-self: flex-end; }
+.series-tab {
+  font-family: var(--cond); font-style: italic; font-weight: 700;
+  font-size: 19px; letter-spacing: .12em; text-transform: uppercase;
+  color: var(--dim); background: none; border: 0;
+  border-bottom: 3px solid transparent;
+  padding: 7px 18px 9px; cursor: pointer;
+  transition: color .12s, border-color .12s;
+}
+.series-tab:hover { color: var(--muted); }
+.series-tab[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
+.series-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+.topbar {
+  display: flex; align-items: baseline; gap: 20px;
+  padding: 9px 22px 11px;
+  border-top: 1px solid var(--line-soft);
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+  flex-wrap: wrap;
+}
+
+.wordmark {
+  font-style: italic; font-weight: 700; font-size: 23px;
+  letter-spacing: .1em; text-transform: uppercase;
+  align-self: flex-end; padding-bottom: 9px;
+}
+.wordmark span { color: var(--accent); }
+
+.season-tag {
+  font-family: var(--mono); font-size: 11px; color: var(--muted);
+  letter-spacing: .1em;
+}
+
+.topbar .spacer { flex: 1; }
+
+.tabs { display: flex; gap: 4px; }
+.tab {
+  font-family: var(--cond); font-style: italic; font-weight: 600;
+  font-size: 14px; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--muted); background: none; border: 0;
+  border-bottom: 2px solid transparent; padding: 4px 13px; cursor: pointer;
+}
+.tab[hidden] { display: none; }
+.tab:hover { color: var(--text); }
+.tab[aria-selected="true"] { color: var(--accent); border-bottom-color: var(--accent); }
+
+main { padding: 22px; }
+.view[hidden] { display: none; }
+
+/* --- schedule strip ----------------------------------------------- */
+
+.strip {
+  display: flex; gap: 3px; overflow-x: auto;
+  padding: 0 22px 15px; background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+/* A Supercars round is 1-4 races. Group them under one label so the
+   strip reads as rounds; the scoring underneath stays one race wide. */
+.round-group { flex: 0 0 auto; padding-top: 15px; position: relative; }
+.round-group + .round-group { margin-left: 9px; padding-left: 9px; border-left: 1px solid var(--line-soft); }
+.round-group .rg-lbl {
+  position: absolute; top: 1px; left: 9px; right: 0;
+  font-family: var(--mono); font-size: 8px; letter-spacing: .14em;
+  text-transform: uppercase; color: var(--dim);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.round-group:first-child .rg-lbl { left: 0; }
+.round-group .rg-races { display: flex; gap: 3px; }
+.strip.grouped { padding-top: 0; align-items: flex-start; }
+thead th.race-h.round-start { border-left: 1px solid var(--line); }
+tbody td.cell.round-start { border-left: 1px solid var(--line-soft); }
+
+.race-chip {
+  flex: 0 0 auto; width: 54px;
+  background: var(--pill); border: 1px solid var(--line);
+  border-radius: 2px; padding: 5px 0 6px; cursor: pointer;
+  text-align: center; color: var(--muted);
+  transition: border-color .12s, color .12s;
+}
+.race-chip:hover { border-color: var(--accent); color: var(--text); }
+.race-chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.race-chip .rn { display: block; font-family: var(--mono); font-size: 8px; color: var(--dim); }
+.race-chip .rc {
+  display: block; font-style: italic; font-weight: 700; font-size: 15px;
+  letter-spacing: .05em; color: inherit; margin-top: 1px;
+}
+.race-chip.done { background: var(--pill-hi); color: var(--text); }
+.race-chip.done .rn { color: var(--accent); }
+.race-chip.next { border-color: var(--accent); }
+
+/* a race worth more than one race's points says so */
+.race-chip .mult, thead th.race-h .mult {
+  display: block; font-family: var(--mono); font-size: 8px;
+  font-style: normal; letter-spacing: .06em; color: var(--accent-lo);
+}
+.race-chip.done .mult { color: var(--accent); }
+
+/* --- standings ---------------------------------------------------- */
+
+.table-wrap {
+  overflow: auto; border: 1px solid var(--line);
+  border-radius: 2px; background: var(--panel);
+  max-height: calc(100vh - 228px);
+}
+
+table { border-collapse: separate; border-spacing: 0; font-family: var(--mono); }
+
+thead th {
+  position: sticky; top: 0; z-index: 20;
+  background: var(--head);
+  border-bottom: 1px solid var(--line);
+  font-family: var(--cond); font-style: italic; font-weight: 600;
+  font-size: 12px; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--muted); padding: 8px 6px; white-space: nowrap; text-align: center;
+}
+
+thead th.race-h { cursor: pointer; font-size: 11px; padding: 8px 2px; }
+thead th.race-h:hover { color: var(--accent); }
+thead th.race-h .rn {
+  display: block; font-family: var(--mono); font-style: normal;
+  font-size: 8px; color: var(--dim);
+}
+
+tbody td {
+  border-bottom: 1px solid var(--line-soft);
+  padding: 0 6px; height: var(--row-h); font-size: 12px;
+  text-align: center; white-space: nowrap; color: var(--text);
+}
+tbody tr:hover td { background: var(--raised); }
+
+.c-rank, .c-num, .c-driver { position: sticky; z-index: 15; background: var(--panel); }
+.c-rank { left: 0; min-width: 42px; color: var(--muted); }
+.c-num {
+  left: var(--pin-num, 42px); min-width: 40px;
+  font-family: var(--cond); font-style: italic; font-weight: 700;
+  font-size: 15px; color: var(--silver);
+}
+.c-driver {
+  left: var(--pin-driver, 84px); min-width: 146px; text-align: left; padding-left: 10px;
+  font-family: var(--cond); font-weight: 500; font-size: 15px;
+  border-right: 1px solid var(--line);
+}
+thead .c-rank, thead .c-num, thead .c-driver { z-index: 25; background: var(--head); }
+tbody tr:hover .c-rank, tbody tr:hover .c-num, tbody tr:hover .c-driver { background: var(--raised); }
+
+.season-pick {
+  background: #000; border: 1px solid var(--line); border-radius: 2px;
+  color: var(--accent); font-family: var(--cond); font-style: italic;
+  font-weight: 700; font-size: 14px; letter-spacing: .08em;
+  padding: 3px 7px; cursor: pointer; width: auto;
+}
+.season-pick:hover { border-color: var(--accent); }
+
+.c-pts, .c-behind { position: sticky; z-index: 15; background: var(--panel); font-size: 12px; }
+.c-pts { right: var(--pin-pts, 62px); min-width: 56px; font-weight: 600; border-left: 1px solid var(--line); }
+.c-behind { right: 0; min-width: 62px; color: var(--muted); }
+thead .c-pts, thead .c-behind { z-index: 25; background: var(--head); }
+tbody tr:hover .c-pts, tbody tr:hover .c-behind { background: var(--raised); }
+.c-behind.leader {
+  color: var(--accent); font-family: var(--cond); font-style: italic;
+  font-weight: 700; font-size: 12px; letter-spacing: .1em;
+}
+
+/* the season grid — gold is the only warm thing on the page */
+.cell { width: var(--cell); min-width: var(--cell); font-size: 11px; color: var(--dim); }
+.cell.p-win { background: var(--win-bg); color: var(--accent); font-weight: 600; }
+.cell.p-t5  { color: var(--silver); }
+.cell.p-t10 { color: #7d8286; }
+.cell.p-dnf { color: var(--dnf); }
+.cell.p-run { color: var(--dim); }
+.cell.empty { color: #26292b; }
+
+.stat { width: 42px; color: var(--muted); border-left: 1px solid var(--line-soft); }
+.stat.wins { color: var(--accent); }
+.stat.zero { color: var(--dim); }
+
+/* --- the chase grid ----------------------------------------------- */
+
+.grid-title {
+  font-size: 40px; line-height: 1; letter-spacing: .13em;
+  margin: 4px 0 26px;
+}
+
+.chase { display: flex; gap: 18px; align-items: flex-start; overflow-x: auto; padding-bottom: 8px; }
+
+/* --stag is set per column in app.js: two slots lower each round, which
+   is exactly what centring each ladder against the last one works out to */
+.round { flex: 0 0 216px; position: relative; margin-top: var(--stag, 0px); }
+.round + .round { padding-left: 16px; }
+
+/* the bracket: a hairline spanning the ladder this round was drawn from */
+.round + .round::before {
+  content: ''; position: absolute; left: 0; top: -35px; bottom: -18px;
+  border-left: 1px solid var(--line);
+}
+.round + .round::after {
+  content: ''; position: absolute; left: 0; top: -35px; width: 9px;
+  border-top: 1px solid var(--line);
+}
+
+.round-tracks {
+  font-size: 11px; font-weight: 500; letter-spacing: .14em;
+  text-transform: uppercase; color: var(--muted);
+  margin-bottom: 8px; min-height: 15px; white-space: nowrap;
+}
+.round.running .round-tracks::after { content: ' · running'; color: var(--accent-lo); }
+
+.ladder { list-style: none; display: flex; flex-direction: column; gap: 3px; }
+
+.slot {
+  display: grid; grid-template-columns: 40px 1fr auto;
+  align-items: center; gap: 9px;
+  background: linear-gradient(var(--pill-hi), var(--pill));
+  border-radius: 2px; height: 26px; padding-right: 9px;
+  position: relative;
+}
+.slot::after {
+  content: ''; position: absolute; left: 40px; top: 4px; bottom: 4px;
+  border-left: 1px solid #34383b;
+}
+
+.slot .car {
+  font-style: italic; font-weight: 700; font-size: 15px;
+  letter-spacing: .02em; text-align: center; color: var(--silver);
+  background: #000; height: 100%; line-height: 26px;
+  border-radius: 2px 0 0 2px;
+}
+.slot .nm { font-size: 15px; font-weight: 500; letter-spacing: .01em; }
+.slot .meta { font-family: var(--mono); font-size: 10px; color: var(--dim); }
+
+.slot.won .car { color: var(--accent); }
+.slot.out { opacity: .3; }
+.slot.out .nm { text-decoration: line-through; }
+.slot.champion { background: linear-gradient(var(--champ-a), var(--champ-b)); }
+.slot.champion .nm { color: var(--accent); font-weight: 700; }
+
+/* chevron round badge */
+.badge {
+  margin-top: 12px; display: flex; align-items: center; gap: 9px;
+  transform: skewX(var(--skew));
+}
+.badge .stripes {
+  flex: 0 0 26px; height: 20px;
+  background: repeating-linear-gradient(90deg, var(--dim) 0 2px, transparent 2px 7px);
+}
+.badge .lbl { background: #000; border: 1px solid var(--line); padding: 3px 12px 4px; }
+.badge .lbl span {
+  display: inline-block; transform: skewX(calc(var(--skew) * -1));
+  font-style: italic; font-weight: 700; font-size: 15px;
+  letter-spacing: .12em; text-transform: uppercase; color: var(--accent);
+}
+.badge .lbl span em { font-style: italic; color: var(--text); margin-left: 7px; }
+
+/* champion plate, where the trophy sits on the real board */
+.plate { flex: 0 0 186px; margin-top: var(--stag, 0px); text-align: center; }
+.plate .name {
+  background: #000; border: 2px solid var(--silver);
+  border-radius: 2px; padding: 11px 8px;
+  font-style: italic; font-weight: 700; font-size: 21px;
+  letter-spacing: .05em; text-transform: uppercase; color: var(--text);
+}
+.plate .name.tbd { color: var(--dim); border-color: var(--line); }
+.plate .title { margin-top: 9px; font-size: 17px; line-height: 1.15; letter-spacing: .12em; }
+
+/* regular-season projection */
+.round.projected { flex: 0 0 260px; }
+.round.projected .round-tracks { color: var(--accent-lo); }
+.slot.bubble-line { position: relative; }
+.slot.bubble-line::before {
+  content: 'CUT LINE'; position: absolute; left: 0; right: 0; bottom: -12px;
+  height: 0; border-top: 1px dashed var(--accent-lo);
+  font-family: var(--mono); font-size: 8px; letter-spacing: .18em;
+  color: var(--accent-lo); text-align: right; padding-top: 2px;
+}
+.ladder { padding-bottom: 4px; }
+.proj-note {
+  flex: 0 0 220px; margin-top: 2px; padding-left: 4px;
+  font-size: 14px; line-height: 1.5; color: var(--muted); letter-spacing: .01em;
+}
+
+.empty-state { padding: 44px 22px; text-align: center; color: var(--muted); font-size: 16px; }
+.empty-state strong {
+  display: block; color: var(--accent); font-size: 24px; margin-bottom: 6px;
+  font-style: italic; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+}
+
+@media (max-width: 900px) {
+  .chase { flex-direction: column; }
+  .round, .plate { flex: 1 1 auto; width: 100%; max-width: 320px; margin-top: 0; }
+  .round + .round { padding-left: 0; }
+  .round + .round::before, .round + .round::after { display: none; }
+  .plate { margin-top: 12px !important; }
+  .grid-title { font-size: 28px; }
+}
+
+/* --- modal -------------------------------------------------------- */
+
+.backdrop {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, .86);
+  z-index: 60; display: flex; align-items: flex-start; justify-content: center;
+  padding: 34px 16px; overflow-y: auto;
+}
+.backdrop[hidden] { display: none; }
+
+.modal {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 2px; width: 100%; max-width: 660px;
+}
+.modal.narrow { max-width: 440px; }
+.modal.wide { max-width: 780px; }
+
+/* --- the season editor -------------------------------------------- */
+
+.modal-tabs {
+  display: flex; gap: 2px; padding: 0 20px;
+  border-bottom: 1px solid var(--line); background: var(--panel);
+  position: sticky; top: 52px; z-index: 2;
+}
+
+.ed-head, .ed-row {
+  display: grid; gap: 7px; align-items: center;
+  padding: 3px 8px;
+}
+.ed-head {
+  font-style: italic; font-weight: 600; font-size: 11px;
+  letter-spacing: .12em; text-transform: uppercase; color: var(--muted);
+  padding-bottom: 6px;
+}
+.ed-driver { grid-template-columns: 58px 1fr 62px 62px 26px; }
+.ed-race   { grid-template-columns: 34px 62px 1fr 40px 1fr 52px 26px; }
+.ed-year   { grid-template-columns: 1fr auto auto; }
+
+.ed-rows {
+  max-height: 46vh; overflow-y: auto;
+  border: 1px solid var(--line); border-radius: 2px;
+}
+.ed-row { border-bottom: 1px solid var(--line-soft); }
+.ed-row:last-child { border-bottom: 0; }
+.ed-row:hover { background: var(--raised); }
+.ed-row input, .ed-row select {
+  padding: 3px 6px; font-size: 13px; border-radius: 2px;
+}
+.ed-row .rnum {
+  font-family: var(--cond); font-style: italic; font-weight: 700;
+  font-size: 14px; color: var(--muted); text-align: right;
+}
+.ed-row .kill { background: none; border: 0; color: var(--dim); cursor: pointer; font-size: 13px; }
+.ed-row .kill:hover { color: var(--danger); }
+.ed-row .kill[disabled] { opacity: .25; cursor: default; }
+.ed-row.current { box-shadow: inset 2px 0 0 var(--accent); }
+.ed-row .yr {
+  font-family: var(--cond); font-style: italic; font-weight: 700;
+  font-size: 16px; letter-spacing: .06em; color: var(--text); padding: 5px 0;
+}
+.ed-row .yr small {
+  font-family: var(--mono); font-style: normal; font-weight: 400;
+  font-size: 10px; letter-spacing: .05em; color: var(--dim); margin-left: 9px;
+}
+.ed-empty { padding: 18px; text-align: center; color: var(--dim); font-family: var(--mono); font-size: 10px; }
+
+/* flex-basis, not width — the global input rule sets width:100% later
+   in this sheet and would otherwise crush the select next to it. */
+.sq-new { display: flex; gap: 8px; align-items: center; }
+.sq-new input { flex: 0 0 96px; }
+.sq-new select { flex: 1 1 auto; min-width: 0; }
+
+/* a bracket pointing at races that no longer exist */
+.chase-warn {
+  border: 1px solid var(--dnf); border-left-width: 3px; border-radius: 2px;
+  padding: 10px 14px; margin-bottom: 18px;
+  font-size: 14px; color: var(--text); line-height: 1.5;
+}
+.chase-warn strong {
+  display: block; font-style: italic; font-weight: 700;
+  letter-spacing: .1em; text-transform: uppercase;
+  font-size: 12px; color: var(--dnf); margin-bottom: 3px;
+}
+
+.modal header {
+  display: flex; align-items: baseline; gap: 10px;
+  padding: 15px 20px; border-bottom: 1px solid var(--line);
+  position: sticky; top: 0; background: var(--panel); z-index: 2;
+}
+.modal header .rnum { font-family: var(--mono); font-size: 11px; color: var(--accent); letter-spacing: .1em; }
+.modal header h2 {
+  font-style: italic; font-weight: 700; font-size: 23px;
+  letter-spacing: .06em; text-transform: uppercase; flex: 1;
+}
+.modal header .track { font-family: var(--mono); font-size: 11px; color: var(--dim); }
+
+.modal-body { padding: 18px 20px 4px; }
+
+.field { margin-bottom: 18px; }
+.field > label, .field-label {
+  display: block; font-style: italic; font-weight: 600; font-size: 12px;
+  letter-spacing: .13em; text-transform: uppercase; color: var(--muted);
+  margin-bottom: 6px;
+}
+.hint { font-family: var(--mono); font-size: 10px; color: var(--dim); margin-top: 5px; line-height: 1.5; }
+
+input[type="text"], input[type="password"], input[type="email"], select, textarea {
+  width: 100%; background: #000; color: var(--text);
+  border: 1px solid var(--line); border-radius: 2px;
+  padding: 7px 9px; font-family: var(--cond); font-size: 15px;
+}
+select { font-size: 14px; }
+input:focus, select:focus, textarea:focus {
+  outline: 2px solid var(--accent); outline-offset: -1px; border-color: transparent;
+}
+
+.drop {
+  border: 1px dashed var(--line); border-radius: 2px;
+  padding: 18px; text-align: center; cursor: pointer;
+  color: var(--muted); font-size: 15px; letter-spacing: .03em;
+  transition: border-color .12s, color .12s;
+}
+.drop:hover, .drop.over { border-color: var(--accent); color: var(--text); }
+.drop input { display: none; }
+.shots { display: flex; gap: 8px; margin-top: 9px; flex-wrap: wrap; }
+.shot { position: relative; width: 92px; height: 62px; border-radius: 2px; overflow: hidden; border: 1px solid var(--line); }
+.shot img { width: 100%; height: 100%; object-fit: cover; }
+.shot button {
+  position: absolute; top: 2px; right: 2px; width: 17px; height: 17px;
+  border: 0; border-radius: 2px; background: rgba(0,0,0,.85);
+  color: var(--text); cursor: pointer; font-size: 11px; line-height: 1;
+}
+
+.results-edit { max-height: 290px; overflow-y: auto; border: 1px solid var(--line); border-radius: 2px; }
+.res-row {
+  display: grid; grid-template-columns: 34px 1fr 58px 26px;
+  gap: 7px; align-items: center; padding: 3px 8px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.res-row:last-child { border-bottom: 0; }
+.res-row .pos {
+  font-family: var(--cond); font-style: italic; font-weight: 700;
+  font-size: 14px; color: var(--muted); text-align: right;
+}
+.res-row.p1 .pos { color: var(--accent); }
+.res-row select { padding: 3px 5px; font-size: 13px; }
+.res-row .dnf-tog {
+  font-family: var(--mono); font-size: 9px; letter-spacing: .06em;
+  background: #000; border: 1px solid var(--line); border-radius: 2px;
+  color: var(--dim); padding: 4px 0; cursor: pointer;
+}
+.res-row .dnf-tog[aria-pressed="true"] { color: var(--dnf); border-color: var(--dnf); }
+.res-row .kill { background: none; border: 0; color: var(--dim); cursor: pointer; font-size: 13px; }
+.res-row .kill:hover { color: var(--danger); }
+
+.modal footer {
+  display: flex; align-items: center; gap: 9px;
+  padding: 14px 20px; border-top: 1px solid var(--line);
+  position: sticky; bottom: 0; background: var(--panel);
+}
+.modal footer .spacer { flex: 1; }
+
+/* --- buttons ------------------------------------------------------ */
+
+.btn {
+  font-family: var(--cond); font-style: italic; font-weight: 600;
+  font-size: 14px; letter-spacing: .11em; text-transform: uppercase;
+  padding: 7px 15px; border-radius: 2px;
+  border: 1px solid var(--line); background: var(--pill);
+  color: var(--text); cursor: pointer; transition: border-color .12s, background .12s;
+}
+.btn:hover { border-color: var(--accent); }
+.btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 700; }
+.btn.primary:hover { background: var(--accent-hi); }
+.btn.ghost { background: none; color: var(--muted); }
+.btn.ghost:hover { color: var(--text); }
+.btn.danger:hover { border-color: var(--danger); color: var(--danger); }
+.btn[disabled] { opacity: .4; cursor: default; }
+.btn.small { font-size: 12px; padding: 5px 10px; }
+
+.status { font-family: var(--mono); font-size: 10px; color: var(--dim); letter-spacing: .05em; min-height: 14px; }
+.status.ok { color: var(--accent); }
+.status.err { color: var(--danger); }
+.status.busy { color: var(--silver); }
+
+.toast {
+  position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+  background: var(--pill-hi); border: 1px solid var(--line);
+  border-radius: 2px; padding: 9px 16px; z-index: 90;
+  font-family: var(--mono); font-size: 11px; letter-spacing: .04em;
+}
+.toast[hidden] { display: none; }
+.toast.err { border-color: var(--danger); color: var(--danger); }
+
+/* --- sign-in gate -------------------------------------------------- */
+
+.gate {
+  position: fixed; inset: 0; z-index: 80;
+  display: flex; align-items: center; justify-content: center;
+  padding: 28px 16px; overflow-y: auto;
+  background: var(--bg);
+}
+.gate[hidden] { display: none; }
+
+.gate-card {
+  width: 100%; max-width: 380px;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 2px; padding: 26px 24px 20px;
+}
+.gate-mark { font-size: 27px; margin-bottom: 4px; align-self: auto; padding-bottom: 0; }
+.gate-lede {
+  font-size: 14px; line-height: 1.5; color: var(--muted);
+  margin-bottom: 22px; letter-spacing: .01em;
+}
+.gate-actions { display: flex; gap: 8px; margin-top: 4px; }
+.gate-actions .btn { flex: 1; }
+.gate .status { margin-top: 12px; line-height: 1.5; }
+
+/* --- sync state ---------------------------------------------------- */
+
+.sync {
+  font-family: var(--mono); font-size: 10px; letter-spacing: .08em;
+  text-transform: uppercase; color: var(--dim); min-width: 58px; text-align: right;
+}
+.sync.busy { color: var(--silver); }
+.sync.ok { color: var(--accent-lo); }
+.sync.err { color: var(--danger); }
+
+.acct {
+  display: flex; align-items: center; gap: 10px;
+  background: #000; border: 1px solid var(--line); border-radius: 2px;
+  padding: 6px 8px 6px 10px;
+}
+.acct span { flex: 1; font-family: var(--mono); font-size: 11px; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Narrow: the masthead wraps to three rows, so take the air out of it. */
+@media (max-width: 620px) {
+  .seriesbar { gap: 0 14px; padding: 8px 16px 0; }
+  .wordmark { font-size: 19px; padding-bottom: 0; width: 100%; }
+  .series-tab { font-size: 16px; padding: 6px 12px 7px; }
+  .series-tabs { order: 3; width: 100%; }
+  .topbar { padding: 7px 16px 9px; gap: 14px; }
+  .strip, main { padding-left: 16px; padding-right: 16px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}
+</style>
+</head>
+<body data-series="nascar">
+
+<div id="app-root" hidden>
+
+<header class="masthead">
+  <!-- tier 1: which series -->
+  <div class="seriesbar">
+    <div class="wordmark" id="wordmark"></div>
+    <div class="series-tabs" id="series-tabs" role="tablist" aria-label="Series"></div>
+    <div class="spacer"></div>
+    <span class="sync" id="sync"></span>
+    <button class="btn small ghost" id="btn-settings">Settings</button>
+    <button class="btn small" id="btn-commit">Commit</button>
+  </div>
+
+  <!-- tier 2: which season, which view — both scoped to the series above -->
+  <div class="topbar">
+    <select class="season-pick" id="season-select" aria-label="Season"></select>
+    <div class="season-tag" id="season-tag">R0/36</div>
+    <button class="btn small ghost" id="btn-season">Edit season</button>
+    <div class="spacer"></div>
+    <div class="tabs" role="tablist" aria-label="View">
+      <button class="tab" role="tab" id="tab-standings" aria-selected="true" aria-controls="view-standings">Standings</button>
+      <button class="tab" role="tab" id="tab-chase" aria-selected="false" aria-controls="view-chase">Chase grid</button>
+    </div>
+  </div>
+</header>
+
+<div class="strip" id="strip"></div>
+
+<main id="series-panel" role="tabpanel">
+  <section class="view" id="view-standings" role="tabpanel" aria-labelledby="tab-standings">
+    <div class="table-wrap">
+      <table id="standings-table"></table>
+    </div>
+  </section>
+
+  <section class="view" id="view-chase" role="tabpanel" aria-labelledby="tab-chase" hidden>
+    <h1 class="grid-title chrome" id="chase-title">The Chase Grid</h1>
+    <div id="chase-body"></div>
+  </section>
+</main>
+
+</div><!-- /app-root -->
+
+<!-- Sign in ---------------------------------------------------------->
+<div class="gate" id="gate">
+  <form class="gate-card" id="gate-form">
+    <div class="wordmark gate-mark">SEASON<span>·</span></div>
+    <p class="gate-lede">Signs in to the same Supabase project as your other apps — use that account, or make a new one.</p>
+
+    <div class="field">
+      <label for="gate-email">Email</label>
+      <input type="email" id="gate-email" autocomplete="username" required>
+    </div>
+    <div class="field">
+      <label for="gate-password">Password</label>
+      <input type="password" id="gate-password" autocomplete="current-password" required>
+    </div>
+
+    <div class="gate-actions">
+      <button class="btn primary" type="submit" id="gate-in">Sign in</button>
+      <button class="btn" type="button" id="gate-up">Create account</button>
+    </div>
+    <p class="status" id="gate-status"></p>
+  </form>
+</div>
+
+<!-- Race entry ------------------------------------------------------->
+<div class="backdrop" id="race-modal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="race-title">
+    <header>
+      <span class="rnum" id="race-num">R1</span>
+      <h2 id="race-title">Daytona 500</h2>
+      <span class="track" id="race-track">DAY</span>
+    </header>
+
+    <div class="modal-body">
+      <div class="field">
+        <label for="pole-select">Pole position</label>
+        <select id="pole-select"></select>
+      </div>
+
+      <div class="field">
+        <span class="field-label">Results screens</span>
+        <label class="drop" id="drop">
+          <span id="drop-label">Drop your results screenshots here, or click to browse</span>
+          <input type="file" id="shots-input" accept="image/*" multiple>
+        </label>
+        <div class="shots" id="shots"></div>
+        <div style="display:flex;gap:9px;align-items:center;margin-top:10px">
+          <button class="btn small" id="btn-read">Read results</button>
+          <span class="status" id="read-status"></span>
+        </div>
+        <p class="hint">Two shots usually covers the field. Everything it reads stays editable below.</p>
+      </div>
+
+      <div class="field">
+        <span class="field-label">Finishing order</span>
+        <div class="results-edit" id="results-edit"></div>
+        <button class="btn small ghost" id="btn-add-row" style="margin-top:8px">Add a position</button>
+      </div>
+
+      <div class="field" id="field-mostlaps">
+        <label for="mostlaps-select">Led the most laps <span style="color:var(--dim)" id="mostlaps-worth">— 1 bonus point</span></label>
+        <select id="mostlaps-select"></select>
+      </div>
+
+      <div class="field">
+        <label for="news-input">Race notes</label>
+        <textarea id="news-input" rows="2" placeholder="Big one on lap 29, Larson flip, Ganassi 1-2"></textarea>
+      </div>
+    </div>
+
+    <footer>
+      <button class="btn danger small" id="btn-clear-race">Clear race</button>
+      <div class="spacer"></div>
+      <button class="btn ghost" id="btn-cancel">Cancel</button>
+      <button class="btn primary" id="btn-done">Done</button>
+    </footer>
+  </div>
+</div>
+
+<!-- Season editor: the field, the calendar, and the list of years ---->
+<div class="backdrop" id="season-modal" hidden>
+  <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="sq-title">
+    <header>
+      <h2 id="sq-title">Edit season</h2>
+      <span class="track" id="sq-sub"></span>
+    </header>
+
+    <div class="modal-tabs" role="tablist" aria-label="Season editor">
+      <button class="tab" role="tab" id="sq-tab-field" aria-selected="true" aria-controls="sq-field">Field</button>
+      <button class="tab" role="tab" id="sq-tab-cal" aria-selected="false" aria-controls="sq-cal">Calendar</button>
+      <button class="tab" role="tab" id="sq-tab-years" aria-selected="false" aria-controls="sq-years">Seasons</button>
+    </div>
+
+    <div class="modal-body">
+      <section id="sq-field" role="tabpanel" aria-labelledby="sq-tab-field">
+        <div class="ed-head ed-driver"><span>#</span><span>Driver</span><span>Poles</span><span>Bonus</span><span></span></div>
+        <div class="ed-rows" id="sq-drivers"></div>
+        <button class="btn small ghost" id="sq-add-driver" style="margin-top:8px">Add a driver</button>
+        <p class="hint">Car number and name are free text. A driver's results follow them when you rename —
+          removing a driver who has results asks first.</p>
+      </section>
+
+      <section id="sq-cal" role="tabpanel" aria-labelledby="sq-tab-cal" hidden>
+        <div class="ed-head ed-race"><span>R</span><span>Code</span><span>Race</span><span>Rnd</span><span>Round name</span><span>×Pts</span><span></span></div>
+        <div class="ed-rows" id="sq-races"></div>
+        <button class="btn small ghost" id="sq-add-race" style="margin-top:8px">Add a race</button>
+        <p class="hint">Races renumber from the top when you save, and results, poles and notes move with them.
+          ×Pts is what the race is worth against the points table — blank or 1 is normal, 2 is an enduro.</p>
+      </section>
+
+      <section id="sq-years" role="tabpanel" aria-labelledby="sq-tab-years" hidden>
+        <span class="field-label">Seasons in this series</span>
+        <div class="ed-rows" id="sq-years-list"></div>
+
+        <div class="field" style="margin-top:20px">
+          <span class="field-label">Add a season</span>
+          <div class="sq-new">
+            <input type="text" id="sq-new-year" placeholder="2026" inputmode="numeric" autocomplete="off" aria-label="New season year">
+            <select id="sq-new-from" aria-label="Start from"></select>
+            <button class="btn small primary" id="sq-new-go">Create</button>
+          </div>
+          <p class="hint">Copying brings the calendar and the field across, never the results.
+            A copied season also takes its own points table and bracket, so changing them
+            here won't disturb the year you copied from.</p>
+        </div>
+      </section>
+    </div>
+
+    <footer>
+      <button class="btn danger small" id="sq-delete">Delete this season</button>
+      <div class="spacer"></div>
+      <span class="status" id="sq-status"></span>
+      <button class="btn ghost" id="sq-cancel">Cancel</button>
+      <button class="btn primary" id="sq-save">Save</button>
+    </footer>
+  </div>
+</div>
+
+<!-- Settings --------------------------------------------------------->
+<div class="backdrop" id="settings-modal" hidden>
+  <div class="modal narrow" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <header><h2 id="settings-title">Settings</h2></header>
+    <div class="modal-body">
+      <div class="field">
+        <span class="field-label">Account</span>
+        <div class="acct">
+          <span id="acct-email">—</span>
+          <button class="btn small ghost" type="button" id="btn-signout">Sign out</button>
+        </div>
+        <p class="hint">Seasons live in Supabase against this account. The two keys below stay in this
+          browser and never leave it, so you enter them once per machine.</p>
+      </div>
+
+      <div class="field">
+        <label for="api-key">Anthropic API key</label>
+        <input type="password" id="api-key" placeholder="sk-ant-…" autocomplete="off">
+        <p class="hint">Reads your results screenshots. Stored in this browser only — it never reaches the repo.</p>
+      </div>
+      <div class="field">
+        <label for="gh-owner">GitHub owner</label>
+        <input type="text" id="gh-owner" placeholder="your-username" autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="gh-repo">Repository</label>
+        <input type="text" id="gh-repo" placeholder="nr2003-season" autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="gh-branch">Branch</label>
+        <input type="text" id="gh-branch" placeholder="main" autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="gh-token">Access token</label>
+        <input type="password" id="gh-token" placeholder="github_pat_…" autocomplete="off">
+        <p class="hint">Fine-grained token, Contents: Read and write, scoped to this one repository. Commit rewrites the season block inside this page.</p>
+      </div>
+      <div class="field">
+        <span class="field-label">Season file</span>
+        <div style="display:flex;gap:8px">
+          <button class="btn small" id="btn-export">Download JSON</button>
+          <button class="btn small" id="btn-import">Load JSON</button>
+          <input type="file" id="import-input" accept="application/json" hidden>
+        </div>
+      </div>
+      <div class="field">
+        <span class="field-label">Danger</span>
+        <button class="btn small danger" id="btn-reset">Reset this season to the committed copy</button>
+      </div>
+    </div>
+    <footer>
+      <span class="status" id="settings-status"></span>
+      <div class="spacer"></div>
+      <button class="btn ghost" id="btn-settings-close">Close</button>
+      <button class="btn primary" id="btn-settings-save">Save</button>
+    </footer>
+  </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<!-- The one script that isn't inlined. Auth and the REST calls both come
+     from it, and it is the same build the other apps on this account use. -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
+<script>
+/* The block between the sentinels is rewritten wholesale by Commit (see
+   commitSeasons): it is JSON on one line, so nothing you type inside the
+   sentinels survives a commit. Notes and TODOs live in the header comment
+   at the top of this file, and inside the data itself as "_todo" string
+   arrays — those are data, so they do survive. */
+/* season:start */
+window.DATA = {"nascar":{"label":"NASCAR","wordmark":["NR","2003"],"screensLabel":"NR2003","points":{"finish":[50,45,44,43,42,41,40,39,38,37,36,35,34,33,32,31,30,29,28,27,26,25,24,23,22,21,20,19,18,17,16,15,14,13,12,11,10,9,8,7,6,5,4],"dnf":1,"bonusPerMostLaps":1},"chase":{"cutoffRace":26,"fieldSize":16,"rounds":[{"name":"Challenger","size":16,"races":[27,28,29],"base":2000,"advance":12},{"name":"Contender","size":12,"races":[30,31,32],"base":3000,"advance":8},{"name":"Eliminator","size":8,"races":[33,34,35],"base":4000,"advance":4},{"name":"Championship","size":4,"races":[36],"base":5000,"advance":1}],"seedBonusPerWin":3,"title":"The Chase Grid","crown":"Cup Champion"},"theme":"nascar","visionPrompt":"These images are the race results screen from the NASCAR Racing 2003 Season PC game. Together they show one full finishing order, split across two screens \u2014 the second image continues where the first stops.\n\nRead every row you can see and return the finishing order.\n\nReturn ONLY a JSON array, no preamble, no markdown fences. Each element:\n{\"pos\": <finishing position as an integer>, \"num\": <car number as an integer>, \"name\": \"<driver surname exactly as printed>\", \"dnf\": <true if the status column shows the car did not finish \u2014 DNF, crash, engine, retired, or similar; otherwise false>}\n\nRules:\n- Order by finishing position, ascending, starting at 1.\n- Do not invent rows. If a row is unreadable, leave it out.\n- If both images show the same row, include it once.\n- Car number is the number beside the driver, not the lap count.","seasons":{"2016":{"year":2016,"schedule":[{"r":1,"code":"DAY","name":"Daytona 500"},{"r":2,"code":"ATL","name":"Atlanta"},{"r":3,"code":"LAS","name":"Las Vegas"},{"r":4,"code":"PHO","name":"Phoenix"},{"r":5,"code":"FON","name":"Fontana"},{"r":6,"code":"MAR","name":"Martinsville"},{"r":7,"code":"TEX","name":"Texas"},{"r":8,"code":"BRI","name":"Bristol"},{"r":9,"code":"RICH","name":"Richmond"},{"r":10,"code":"TALL","name":"Talladega"},{"r":11,"code":"KAN","name":"Kansas"},{"r":12,"code":"DOV","name":"Dover"},{"r":13,"code":"CHA","name":"Charlotte"},{"r":14,"code":"POC","name":"Pocono"},{"r":15,"code":"MCH","name":"Michigan"},{"r":16,"code":"SON","name":"Sonoma"},{"r":17,"code":"DAY","name":"Daytona 2"},{"r":18,"code":"KEN","name":"Kentucky"},{"r":19,"code":"NEW","name":"New Hampshire"},{"r":20,"code":"IND","name":"Indianapolis"},{"r":21,"code":"POC","name":"Pocono 2"},{"r":22,"code":"WAT","name":"Watkins Glen"},{"r":23,"code":"BRI","name":"Bristol 2"},{"r":24,"code":"MCH","name":"Michigan 2"},{"r":25,"code":"DARL","name":"Darlington"},{"r":26,"code":"RICH","name":"Richmond 2"},{"r":27,"code":"CHI","name":"Chicagoland"},{"r":28,"code":"NEW","name":"New Hampshire 2"},{"r":29,"code":"DOV","name":"Dover 2"},{"r":30,"code":"CHA","name":"Charlotte 2"},{"r":31,"code":"KAN","name":"Kansas 2"},{"r":32,"code":"TALL","name":"Talladega 2"},{"r":33,"code":"MAR","name":"Martinsville 2"},{"r":34,"code":"TEX","name":"Texas 2"},{"r":35,"code":"PHO","name":"Phoenix 2"},{"r":36,"code":"HOM","name":"Homestead"}],"drivers":[{"id":"keselowski","num":2,"name":"Keselowski","legacyPoles":2,"legacyBonus":5},{"id":"mcmurray","num":1,"name":"McMurray","legacyPoles":4,"legacyBonus":4},{"id":"hamlin","num":11,"name":"Hamlin","legacyPoles":3,"legacyBonus":3},{"id":"ku-busch","num":41,"name":"Ku. Busch","legacyPoles":0,"legacyBonus":1},{"id":"ky-busch","num":18,"name":"Ky. Busch","legacyPoles":3,"legacyBonus":3},{"id":"truex-jr","num":78,"name":"Truex Jr.","legacyPoles":4,"legacyBonus":1},{"id":"logano","num":22,"name":"Logano","legacyPoles":3,"legacyBonus":5},{"id":"harvick","num":4,"name":"Harvick","legacyPoles":3,"legacyBonus":4},{"id":"johnson","num":48,"name":"Johnson","legacyPoles":0,"legacyBonus":0},{"id":"edwards","num":19,"name":"Edwards","legacyPoles":0,"legacyBonus":0},{"id":"kenseth","num":20,"name":"Kenseth","legacyPoles":1,"legacyBonus":0},{"id":"mcdougall","num":8,"name":"McDougall","legacyPoles":8,"legacyBonus":4},{"id":"larson","num":42,"name":"Larson","legacyPoles":0,"legacyBonus":2},{"id":"kahne","num":5,"name":"Kahne","legacyPoles":0,"legacyBonus":0},{"id":"newman","num":31,"name":"Newman","legacyPoles":0,"legacyBonus":0},{"id":"blaney","num":21,"name":"Blaney","legacyPoles":0,"legacyBonus":0},{"id":"elliott","num":24,"name":"Elliott","legacyPoles":1,"legacyBonus":1},{"id":"allmendinger","num":47,"name":"Allmendinger","legacyPoles":0,"legacyBonus":0},{"id":"almirola","num":43,"name":"Almirola","legacyPoles":1,"legacyBonus":1},{"id":"biffle","num":16,"name":"Biffle","legacyPoles":0,"legacyBonus":0},{"id":"bayne","num":6,"name":"Bayne","legacyPoles":1,"legacyBonus":0},{"id":"stenhouse-jr","num":17,"name":"Stenhouse Jr.","legacyPoles":0,"legacyBonus":0},{"id":"a-dillon","num":3,"name":"A. Dillon","legacyPoles":0,"legacyBonus":0},{"id":"bowyer","num":15,"name":"Bowyer","legacyPoles":1,"legacyBonus":0},{"id":"patrick","num":10,"name":"Patrick","legacyPoles":0,"legacyBonus":0},{"id":"menard","num":27,"name":"Menard","legacyPoles":0,"legacyBonus":0},{"id":"buescher","num":34,"name":"Buescher","legacyPoles":0,"legacyBonus":0},{"id":"scott","num":44,"name":"Scott","legacyPoles":0,"legacyBonus":0},{"id":"stewart","num":14,"name":"Stewart","legacyPoles":0,"legacyBonus":0},{"id":"mears","num":13,"name":"Mears","legacyPoles":0,"legacyBonus":0},{"id":"cassill","num":38,"name":"Cassill","legacyPoles":0,"legacyBonus":0},{"id":"ragan","num":23,"name":"Ragan","legacyPoles":0,"legacyBonus":1},{"id":"annett","num":46,"name":"Annett","legacyPoles":0,"legacyBonus":0},{"id":"earnhardt-jr","num":88,"name":"Earnhardt Jr.","legacyPoles":0,"legacyBonus":0},{"id":"gordon","num":88,"name":"Gordon","legacyPoles":0,"legacyBonus":0},{"id":"smith","num":7,"name":"Smith","legacyPoles":0,"legacyBonus":0},{"id":"dibenedetto","num":93,"name":"DiBenedetto","legacyPoles":0,"legacyBonus":0},{"id":"mcdowell","num":95,"name":"McDowell","legacyPoles":0,"legacyBonus":0},{"id":"t-dillon","num":95,"name":"T. Dillon","legacyPoles":0,"legacyBonus":0},{"id":"gilliland","num":35,"name":"Gilliland","legacyPoles":0,"legacyBonus":0},{"id":"vickers","num":14,"name":"Vickers","legacyPoles":0,"legacyBonus":0},{"id":"gaulding","num":30,"name":"Gaulding","legacyPoles":0,"legacyBonus":0},{"id":"j-earnhardt","num":32,"name":"J. Earnhardt","legacyPoles":0,"legacyBonus":0},{"id":"whitt","num":98,"name":"Whitt","legacyPoles":0,"legacyBonus":0},{"id":"richardson","num":26,"name":"Richardson","legacyPoles":0,"legacyBonus":0},{"id":"hill","num":98,"name":"Hill","legacyPoles":0,"legacyBonus":0},{"id":"b-labonte","num":32,"name":"B. Labonte","legacyPoles":0,"legacyBonus":0},{"id":"sorenson","num":55,"name":"Sorenson","legacyPoles":0,"legacyBonus":0},{"id":"wise","num":30,"name":"Wise","legacyPoles":0,"legacyBonus":0}],"results":{"1":{"keselowski":"DNF","mcmurray":1,"hamlin":17,"ku-busch":14,"ky-busch":18,"truex-jr":15,"logano":9,"harvick":24,"johnson":"DNF","edwards":22,"kenseth":19,"mcdougall":2,"larson":"DNF","kahne":11,"newman":"DNF","blaney":27,"elliott":5,"allmendinger":7,"almirola":8,"biffle":10,"bayne":"DNF","stenhouse-jr":16,"a-dillon":26,"bowyer":"DNF","patrick":"DNF","menard":"DNF","buescher":"DNF","scott":4,"mears":20,"cassill":6,"ragan":25,"annett":"DNF","earnhardt-jr":3,"smith":"DNF","dibenedetto":13,"t-dillon":21,"gilliland":"DNF","vickers":12,"gaulding":23,"j-earnhardt":"DNF","whitt":"DNF","richardson":"DNF"},"2":{"keselowski":5,"mcmurray":1,"hamlin":28,"ku-busch":11,"ky-busch":3,"truex-jr":4,"logano":10,"harvick":2,"johnson":13,"edwards":"DNF","kenseth":15,"mcdougall":26,"larson":6,"kahne":"DNF","newman":7,"blaney":24,"elliott":"DNF","allmendinger":"DNF","almirola":"DNF","biffle":"DNF","bayne":16,"stenhouse-jr":8,"a-dillon":25,"bowyer":9,"patrick":17,"menard":"DNF","buescher":21,"scott":29,"mears":18,"cassill":"DNF","ragan":20,"annett":19,"earnhardt-jr":12,"smith":"DNF","dibenedetto":14,"mcdowell":23,"t-dillon":27,"gilliland":"DNF","vickers":"DNF","j-earnhardt":"DNF","whitt":22},"3":{"keselowski":3,"mcmurray":16,"hamlin":1,"ku-busch":20,"ky-busch":7,"truex-jr":5,"logano":23,"harvick":4,"johnson":2,"edwards":22,"kenseth":11,"mcdougall":9,"larson":17,"kahne":21,"newman":14,"blaney":24,"elliott":28,"allmendinger":30,"almirola":13,"biffle":18,"bayne":12,"stenhouse-jr":8,"a-dillon":25,"bowyer":10,"patrick":36,"menard":6,"buescher":29,"scott":31,"mears":38,"cassill":19,"ragan":15,"annett":35,"earnhardt-jr":26,"smith":37,"dibenedetto":27,"mcdowell":32,"t-dillon":33,"vickers":41,"j-earnhardt":42,"hill":34,"wise":"DNF"},"4":{"keselowski":1,"mcmurray":2,"hamlin":19,"ku-busch":3,"ky-busch":24,"truex-jr":10,"logano":11,"harvick":13,"johnson":12,"edwards":8,"kenseth":14,"mcdougall":4,"larson":27,"kahne":23,"newman":31,"blaney":25,"elliott":7,"allmendinger":15,"almirola":16,"biffle":34,"bayne":5,"stenhouse-jr":21,"a-dillon":18,"bowyer":6,"patrick":9,"menard":28,"buescher":30,"scott":41,"mears":35,"cassill":21,"ragan":26,"annett":38,"earnhardt-jr":20,"smith":37,"dibenedetto":36,"mcdowell":17,"t-dillon":33,"gilliland":40,"vickers":29,"whitt":32,"wise":39},"5":{"keselowski":10,"mcmurray":11,"hamlin":3,"ku-busch":1,"ky-busch":12,"truex-jr":7,"logano":5,"harvick":4,"johnson":14,"edwards":22,"kenseth":19,"mcdougall":9,"larson":15,"kahne":8,"newman":16,"blaney":30,"elliott":25,"allmendinger":28,"almirola":23,"biffle":21,"bayne":24,"stenhouse-jr":6,"a-dillon":20,"bowyer":18,"patrick":2,"menard":34,"buescher":33,"scott":38,"mears":13,"cassill":29,"ragan":17,"annett":37,"earnhardt-jr":36,"smith":35,"dibenedetto":40,"mcdowell":32,"t-dillon":27,"gilliland":41,"vickers":31,"whitt":26,"wise":39},"6":{"keselowski":10,"mcmurray":1,"hamlin":5,"ku-busch":16,"ky-busch":21,"truex-jr":6,"logano":7,"harvick":8,"johnson":3,"edwards":19,"kenseth":22,"mcdougall":15,"larson":4,"kahne":13,"newman":2,"blaney":36,"elliott":29,"allmendinger":11,"almirola":23,"biffle":28,"bayne":35,"stenhouse-jr":30,"a-dillon":12,"bowyer":9,"patrick":26,"menard":18,"buescher":38,"scott":37,"mears":17,"cassill":33,"ragan":40,"annett":39,"earnhardt-jr":14,"smith":32,"dibenedetto":20,"mcdowell":31,"t-dillon":34,"vickers":25,"j-earnhardt":24,"whitt":41,"wise":27},"7":{"keselowski":8,"mcmurray":16,"hamlin":22,"ku-busch":2,"ky-busch":1,"truex-jr":12,"logano":10,"harvick":19,"johnson":4,"edwards":5,"kenseth":17,"mcdougall":29,"larson":15,"kahne":3,"newman":11,"blaney":6,"elliott":9,"allmendinger":7,"almirola":13,"biffle":25,"bayne":21,"stenhouse-jr":20,"a-dillon":24,"bowyer":30,"patrick":18,"menard":23,"buescher":28,"scott":26,"mears":31,"cassill":37,"ragan":34,"annett":39,"earnhardt-jr":14,"smith":32,"dibenedetto":36,"mcdowell":38,"t-dillon":33,"vickers":27,"gaulding":35,"j-earnhardt":40},"8":{"keselowski":28,"mcmurray":2,"hamlin":6,"ku-busch":1,"ky-busch":4,"truex-jr":35,"logano":36,"harvick":3,"johnson":14,"edwards":30,"kenseth":7,"mcdougall":19,"larson":5,"kahne":9,"newman":11,"blaney":15,"elliott":22,"allmendinger":"DNF","almirola":10,"biffle":13,"bayne":12,"stenhouse-jr":18,"a-dillon":17,"bowyer":16,"patrick":24,"menard":33,"buescher":23,"scott":34,"mears":21,"cassill":29,"ragan":26,"annett":31,"earnhardt-jr":8,"smith":25,"dibenedetto":20,"t-dillon":"DNF","vickers":27,"gaulding":32,"hill":"DNF"},"9":{"keselowski":11,"mcmurray":9,"hamlin":14,"ku-busch":10,"ky-busch":1,"truex-jr":7,"logano":5,"harvick":6,"johnson":15,"edwards":2,"kenseth":4,"mcdougall":3,"larson":12,"kahne":18,"newman":8,"blaney":23,"elliott":16,"allmendinger":20,"almirola":17,"biffle":21,"bayne":24,"stenhouse-jr":35,"a-dillon":27,"bowyer":25,"patrick":19,"menard":29,"buescher":13,"scott":30,"mears":34,"cassill":31,"ragan":33,"annett":32,"earnhardt-jr":22,"smith":32,"t-dillon":36,"vickers":26},"10":{"keselowski":"DNF","mcmurray":"DNF","hamlin":8,"ku-busch":15,"ky-busch":13,"truex-jr":12,"logano":"DNF","harvick":"DNF","johnson":"DNF","edwards":1,"kenseth":"DNF","mcdougall":2,"larson":"DNF","kahne":"DNF","newman":"DNF","blaney":"DNF","elliott":3,"allmendinger":"DNF","almirola":"DNF","biffle":5,"bayne":14,"stenhouse-jr":10,"a-dillon":6,"bowyer":"DNF","patrick":"DNF","menard":16,"buescher":"DNF","scott":17,"mears":23,"cassill":9,"ragan":4,"annett":18,"earnhardt-jr":11,"smith":19,"dibenedetto":"DNF","mcdowell":7,"t-dillon":"DNF","gilliland":"DNF","vickers":"DNF","gaulding":21,"whitt":20,"richardson":24,"sorenson":22},"11":{"keselowski":8,"mcmurray":7,"hamlin":10,"ku-busch":9,"ky-busch":6,"truex-jr":19,"logano":14,"harvick":1,"johnson":15,"edwards":12,"kenseth":36,"mcdougall":2,"larson":3,"kahne":13,"newman":4,"blaney":16,"elliott":37,"allmendinger":5,"almirola":18,"biffle":27,"bayne":21,"stenhouse-jr":26,"a-dillon":17,"bowyer":25,"patrick":23,"menard":20,"buescher":24,"scott":28,"stewart":22,"mears":38,"cassill":29,"ragan":35,"annett":40,"earnhardt-jr":11,"smith":33,"t-dillon":34,"gilliland":39,"j-earnhardt":31,"sorenson":30,"wise":32},"12":{"keselowski":9,"mcmurray":5,"hamlin":15,"ku-busch":11,"ky-busch":13,"truex-jr":2,"logano":10,"harvick":1,"johnson":8,"edwards":37,"kenseth":6,"mcdougall":39,"larson":36,"kahne":4,"newman":3,"blaney":33,"elliott":7,"allmendinger":20,"almirola":21,"biffle":23,"bayne":24,"stenhouse-jr":16,"a-dillon":14,"bowyer":17,"patrick":18,"menard":22,"buescher":26,"scott":19,"stewart":12,"mears":31,"cassill":38,"ragan":28,"annett":40,"earnhardt-jr":25,"smith":34,"dibenedetto":35,"t-dillon":27,"gaulding":30,"j-earnhardt":32,"sorenson":29},"13":{"keselowski":6,"mcmurray":15,"hamlin":19,"ku-busch":"DNF","ky-busch":12,"truex-jr":8,"logano":1,"harvick":"DNF","johnson":4,"edwards":5,"kenseth":18,"mcdougall":"DNF","larson":16,"kahne":21,"newman":2,"blaney":9,"elliott":40,"allmendinger":3,"almirola":13,"biffle":11,"bayne":20,"stenhouse-jr":34,"a-dillon":10,"bowyer":17,"patrick":31,"menard":23,"buescher":14,"scott":30,"stewart":22,"mears":29,"cassill":28,"ragan":32,"annett":25,"earnhardt-jr":7,"smith":24,"dibenedetto":26,"mcdowell":"DNF","t-dillon":33,"gaulding":"DNF","richardson":"DNF","hill":"DNF","sorenson":"DNF","wise":"DNF"},"14":{"keselowski":14,"mcmurray":18,"hamlin":4,"ku-busch":"DNF","ky-busch":9,"truex-jr":10,"logano":29,"harvick":28,"johnson":5,"edwards":8,"kenseth":7,"mcdougall":1,"larson":11,"kahne":3,"newman":2,"blaney":27,"elliott":21,"allmendinger":13,"almirola":22,"biffle":23,"bayne":12,"stenhouse-jr":15,"a-dillon":24,"bowyer":16,"patrick":26,"menard":17,"buescher":19,"scott":25,"stewart":6,"cassill":35,"annett":30,"earnhardt-jr":20,"smith":32,"mcdowell":34,"t-dillon":33,"gaulding":31},"15":{"keselowski":5,"mcmurray":12,"hamlin":"DNF","ku-busch":22,"ky-busch":10,"truex-jr":4,"logano":9,"harvick":3,"johnson":11,"edwards":15,"kenseth":7,"mcdougall":2,"larson":1,"kahne":18,"newman":6,"blaney":8,"elliott":19,"allmendinger":30,"almirola":26,"biffle":17,"bayne":21,"stenhouse-jr":24,"a-dillon":28,"bowyer":23,"patrick":13,"menard":27,"buescher":20,"scott":14,"stewart":25,"mears":29,"cassill":32,"ragan":34,"annett":33,"earnhardt-jr":16,"t-dillon":31,"sorenson":35},"16":{"keselowski":3,"mcmurray":"DNF","hamlin":11,"ku-busch":7,"ky-busch":2,"truex-jr":9,"logano":1,"harvick":4,"johnson":8,"edwards":6,"kenseth":10,"mcdougall":5,"larson":"DNF","kahne":26,"newman":"DNF","blaney":13,"elliott":"DNF","allmendinger":20,"almirola":15,"biffle":16,"bayne":12,"stenhouse-jr":23,"a-dillon":21,"bowyer":22,"patrick":18,"menard":19,"buescher":32,"scott":31,"stewart":17,"mears":28,"cassill":"DNF","ragan":"DNF","annett":24,"earnhardt-jr":14,"smith":25,"t-dillon":27,"gaulding":"DNF","j-earnhardt":29,"sorenson":30},"17":{"keselowski":5,"mcmurray":4,"hamlin":18,"ku-busch":3,"ky-busch":"DNF","truex-jr":"DNF","logano":"DNF","harvick":"DNF","johnson":"DNF","edwards":10,"kenseth":15,"mcdougall":1,"larson":19,"kahne":20,"newman":12,"blaney":8,"elliott":13,"allmendinger":7,"almirola":2,"biffle":17,"bayne":6,"stenhouse-jr":9,"a-dillon":"DNF","bowyer":"DNF","patrick":28,"menard":"DNF","buescher":11,"scott":21,"stewart":"DNF","mears":25,"cassill":26,"ragan":14,"annett":27,"earnhardt-jr":16,"smith":"DNF","dibenedetto":22,"mcdowell":"DNF","t-dillon":"DNF","gilliland":"DNF","richardson":"DNF","hill":24,"b-labonte":23},"18":{"keselowski":18,"mcmurray":13,"hamlin":5,"ku-busch":2,"ky-busch":11,"truex-jr":9,"logano":1,"harvick":3,"johnson":7,"edwards":8,"kenseth":4,"mcdougall":"DNF","larson":17,"kahne":10,"newman":26,"blaney":14,"elliott":6,"allmendinger":27,"almirola":12,"biffle":15,"bayne":23,"stenhouse-jr":20,"a-dillon":24,"bowyer":16,"patrick":25,"menard":29,"buescher":22,"scott":30,"stewart":19,"mears":34,"cassill":33,"ragan":35,"annett":32,"gordon":21,"smith":28,"dibenedetto":38,"t-dillon":36,"hill":37,"sorenson":31},"19":{"keselowski":2,"mcmurray":16,"hamlin":3,"ku-busch":8,"ky-busch":7,"truex-jr":10,"logano":6,"harvick":1,"johnson":12,"edwards":4,"kenseth":"DNF","mcdougall":35,"larson":18,"kahne":20,"newman":"DNF","blaney":9,"elliott":5,"allmendinger":21,"almirola":13,"biffle":11,"bayne":23,"stenhouse-jr":27,"a-dillon":17,"bowyer":33,"patrick":25,"menard":30,"buescher":19,"scott":24,"stewart":15,"mears":26,"cassill":28,"ragan":"DNF","annett":32,"gordon":14,"smith":22,"t-dillon":29,"j-earnhardt":34,"richardson":31},"20":{"keselowski":6,"mcmurray":21,"hamlin":17,"ku-busch":2,"ky-busch":11,"truex-jr":7,"logano":1,"harvick":12,"johnson":14,"edwards":13,"kenseth":8,"mcdougall":36,"larson":10,"kahne":15,"newman":5,"blaney":3,"elliott":4,"allmendinger":16,"almirola":27,"biffle":9,"bayne":26,"stenhouse-jr":24,"a-dillon":35,"bowyer":23,"patrick":22,"menard":19,"buescher":18,"scott":25,"stewart":28,"mears":29,"cassill":34,"annett":31,"gordon":20,"smith":30,"t-dillon":33,"gilliland":"DNF","j-earnhardt":"DNF","richardson":32},"21":{"keselowski":3,"mcmurray":6,"hamlin":"DNF","ku-busch":"DNF","ky-busch":4,"truex-jr":18,"logano":15,"harvick":1,"johnson":14,"edwards":29,"kenseth":7,"mcdougall":"DNF","larson":5,"kahne":13,"newman":11,"blaney":9,"elliott":10,"allmendinger":2,"almirola":26,"biffle":8,"bayne":19,"stenhouse-jr":"DNF","a-dillon":16,"bowyer":17,"patrick":21,"menard":12,"buescher":"DNF","scott":"DNF","stewart":28,"mears":24,"cassill":27,"ragan":"DNF","annett":25,"gordon":"DNF","smith":"DNF","dibenedetto":22,"mcdowell":23,"gilliland":20},"22":{"keselowski":5,"mcmurray":10,"hamlin":9,"ku-busch":2,"ky-busch":1,"truex-jr":4,"logano":6,"harvick":3,"johnson":11,"edwards":14,"kenseth":8,"mcdougall":26,"larson":9,"kahne":13,"newman":38,"blaney":12,"elliott":15,"allmendinger":17,"almirola":18,"biffle":21,"bayne":24,"stenhouse-jr":25,"a-dillon":22,"bowyer":20,"patrick":35,"menard":27,"buescher":23,"scott":28,"stewart":16,"mears":34,"cassill":29,"ragan":32,"annett":33,"gordon":19,"smith":36,"dibenedetto":30,"mcdowell":31,"gilliland":37},"23":{"keselowski":3,"mcmurray":9,"hamlin":6,"ku-busch":28,"ky-busch":5,"truex-jr":10,"logano":11,"harvick":15,"johnson":1,"edwards":4,"kenseth":7,"mcdougall":12,"larson":16,"kahne":18,"newman":14,"blaney":8,"elliott":32,"allmendinger":30,"almirola":2,"biffle":"DNF","bayne":25,"stenhouse-jr":24,"a-dillon":22,"bowyer":"DNF","patrick":13,"menard":19,"buescher":17,"scott":23,"stewart":21,"mears":"DNF","cassill":27,"ragan":"DNF","annett":29,"gordon":20,"smith":26,"dibenedetto":31,"mcdowell":33,"richardson":"DNF"},"24":{"keselowski":2,"mcmurray":15,"hamlin":16,"ku-busch":8,"ky-busch":1,"truex-jr":3,"logano":4,"harvick":5,"johnson":17,"edwards":25,"kenseth":9,"mcdougall":6,"larson":12,"kahne":24,"newman":7,"blaney":10,"elliott":14,"allmendinger":11,"almirola":21,"biffle":26,"bayne":18,"stenhouse-jr":13,"a-dillon":"DNF","bowyer":27,"patrick":28,"menard":32,"buescher":19,"scott":23,"stewart":20,"mears":31,"cassill":34,"ragan":33,"annett":35,"gordon":22,"smith":29,"dibenedetto":36,"mcdowell":30,"richardson":37},"25":{"keselowski":12,"mcmurray":3,"hamlin":5,"ku-busch":11,"ky-busch":2,"truex-jr":1,"logano":28,"harvick":6,"johnson":7,"edwards":20,"kenseth":14,"mcdougall":13,"larson":15,"kahne":29,"newman":17,"blaney":18,"elliott":4,"allmendinger":8,"almirola":9,"biffle":21,"bayne":26,"stenhouse-jr":30,"a-dillon":22,"bowyer":24,"patrick":27,"menard":16,"buescher":19,"scott":33,"stewart":25,"mears":34,"cassill":23,"ragan":35,"annett":37,"gordon":10,"smith":38,"dibenedetto":36,"mcdowell":32,"gilliland":31},"26":{"keselowski":16,"mcmurray":5,"hamlin":19,"ku-busch":3,"ky-busch":1,"truex-jr":7,"logano":2,"harvick":12,"johnson":4,"edwards":6,"kenseth":15,"mcdougall":8,"larson":14,"kahne":17,"newman":9,"blaney":18,"elliott":13,"allmendinger":20,"almirola":24,"biffle":11,"bayne":29,"stenhouse-jr":27,"a-dillon":22,"bowyer":25,"patrick":30,"menard":21,"buescher":23,"scott":28,"stewart":26,"mears":36,"cassill":38,"ragan":35,"annett":37,"gordon":10,"smith":33,"dibenedetto":34,"mcdowell":32,"gilliland":31},"27":{"keselowski":1,"mcmurray":22,"hamlin":3,"ku-busch":5,"ky-busch":2,"truex-jr":11,"logano":4,"harvick":7,"johnson":23,"edwards":13,"kenseth":8,"mcdougall":6,"larson":25,"kahne":9,"newman":12,"blaney":17,"elliott":15,"allmendinger":10,"almirola":26,"biffle":28,"bayne":27,"stenhouse-jr":18,"a-dillon":21,"bowyer":20,"patrick":30,"menard":14,"buescher":24,"scott":29,"stewart":16,"mears":32,"cassill":33,"ragan":37,"annett":36,"gordon":19,"smith":31,"dibenedetto":38,"mcdowell":35,"gilliland":34},"28":{"keselowski":7,"mcmurray":8,"hamlin":3,"ku-busch":11,"ky-busch":38,"truex-jr":2,"logano":1,"harvick":15,"johnson":14,"edwards":5,"kenseth":19,"mcdougall":4,"larson":6,"kahne":20,"newman":10,"blaney":17,"elliott":18,"allmendinger":9,"almirola":21,"biffle":16,"bayne":30,"stenhouse-jr":31,"a-dillon":26,"bowyer":24,"patrick":13,"menard":22,"buescher":25,"scott":27,"stewart":23,"mears":29,"cassill":33,"ragan":36,"annett":28,"gordon":12,"smith":37,"dibenedetto":32,"mcdowell":35,"gilliland":34},"29":{"keselowski":6,"mcmurray":3,"hamlin":2,"ku-busch":5,"ky-busch":13,"truex-jr":4,"logano":1,"harvick":8,"johnson":7,"edwards":20,"kenseth":9,"mcdougall":16,"larson":10,"kahne":11,"newman":"DNF","blaney":15,"elliott":14,"allmendinger":18,"almirola":17,"biffle":"DNF","bayne":21,"stenhouse-jr":32,"a-dillon":19,"bowyer":31,"patrick":12,"menard":"DNF","buescher":23,"scott":29,"stewart":34,"mears":30,"cassill":28,"ragan":26,"annett":27,"gordon":"DNF","smith":33,"dibenedetto":24,"mcdowell":22,"gilliland":25},"30":{"keselowski":7,"mcmurray":4,"hamlin":1,"ku-busch":2,"ky-busch":10,"truex-jr":9,"logano":5,"harvick":31,"johnson":3,"edwards":8,"kenseth":27,"mcdougall":26,"larson":"DNF","kahne":11,"newman":"DNF","blaney":15,"elliott":21,"allmendinger":24,"almirola":13,"biffle":12,"bayne":6,"stenhouse-jr":16,"a-dillon":17,"bowyer":20,"patrick":19,"menard":25,"buescher":23,"scott":22,"stewart":18,"mears":34,"cassill":29,"ragan":30,"annett":36,"gordon":14,"smith":35,"dibenedetto":32,"mcdowell":28,"gilliland":33},"31":{"keselowski":7,"mcmurray":1,"hamlin":3,"ku-busch":10,"ky-busch":6,"truex-jr":5,"logano":9,"harvick":8,"johnson":13,"edwards":4,"kenseth":15,"mcdougall":2,"larson":18,"kahne":28,"newman":22,"blaney":14,"elliott":26,"allmendinger":16,"almirola":11,"biffle":25,"bayne":38,"stenhouse-jr":21,"a-dillon":27,"bowyer":17,"patrick":19,"menard":23,"buescher":20,"scott":30,"stewart":24,"mears":31,"cassill":36,"ragan":33,"annett":32,"gordon":12,"smith":34,"dibenedetto":35,"mcdowell":29,"gilliland":37},"32":{"keselowski":24,"mcmurray":5,"hamlin":13,"ku-busch":20,"ky-busch":3,"truex-jr":8,"logano":21,"harvick":"DNF","johnson":19,"edwards":12,"kenseth":2,"mcdougall":25,"larson":11,"kahne":"DNF","newman":6,"blaney":"DNF","elliott":23,"allmendinger":"DNF","almirola":27,"biffle":18,"bayne":4,"stenhouse-jr":15,"a-dillon":16,"bowyer":"DNF","patrick":28,"menard":7,"buescher":"DNF","scott":9,"stewart":"DNF","mears":"DNF","cassill":"DNF","ragan":1,"annett":14,"gordon":10,"smith":17,"dibenedetto":"DNF","mcdowell":26,"gilliland":22},"33":{"keselowski":6,"mcmurray":1,"hamlin":14,"ku-busch":5,"ky-busch":17,"truex-jr":15,"logano":8,"harvick":2,"johnson":3,"edwards":7,"kenseth":35,"mcdougall":13,"larson":4,"kahne":12,"newman":11,"blaney":37,"elliott":"DNF","allmendinger":20,"almirola":36,"biffle":16,"bayne":19,"stenhouse-jr":28,"a-dillon":25,"bowyer":18,"patrick":26,"menard":22,"buescher":21,"scott":23,"stewart":9,"mears":29,"cassill":31,"ragan":27,"annett":32,"gordon":10,"smith":24,"dibenedetto":30,"mcdowell":34,"gilliland":33},"34":{"keselowski":1,"mcmurray":10,"hamlin":2,"ku-busch":11,"ky-busch":15,"truex-jr":3,"logano":17,"harvick":13,"johnson":12,"edwards":5,"kenseth":19,"mcdougall":7,"larson":23,"kahne":8,"newman":27,"blaney":26,"elliott":9,"allmendinger":6,"almirola":4,"biffle":18,"bayne":24,"stenhouse-jr":14,"a-dillon":32,"bowyer":16,"patrick":29,"menard":20,"buescher":21,"scott":28,"stewart":25,"mears":31,"cassill":36,"ragan":34,"annett":35,"gordon":22,"smith":30,"dibenedetto":38,"mcdowell":33,"gilliland":37},"35":{"keselowski":2,"mcmurray":3,"hamlin":6,"ku-busch":4,"ky-busch":12,"truex-jr":9,"logano":14,"harvick":10,"johnson":5,"edwards":18,"kenseth":15,"mcdougall":1,"larson":13,"kahne":8,"newman":16,"blaney":11,"elliott":7,"allmendinger":17,"almirola":21,"biffle":24,"bayne":23,"stenhouse-jr":27,"a-dillon":19,"bowyer":22,"patrick":32,"menard":26,"buescher":31,"scott":29,"stewart":20,"mears":28,"cassill":34,"ragan":35,"annett":33,"gordon":25,"smith":37,"dibenedetto":36,"mcdowell":30,"gilliland":38},"36":{"keselowski":12,"mcmurray":4,"hamlin":1,"ku-busch":16,"ky-busch":7,"truex-jr":6,"logano":2,"harvick":9,"johnson":13,"edwards":5,"kenseth":8,"mcdougall":38,"larson":11,"kahne":21,"newman":3,"blaney":14,"elliott":19,"allmendinger":10,"almirola":27,"biffle":26,"bayne":22,"stenhouse-jr":24,"a-dillon":29,"bowyer":15,"patrick":20,"menard":23,"buescher":25,"scott":28,"stewart":17,"mears":36,"cassill":30,"ragan":34,"annett":35,"gordon":18,"smith":31,"dibenedetto":33,"mcdowell":37,"gilliland":32}},"poles":{},"mostLaps":{},"news":{"1":"Big one Lap 29, Larson flip, Hendrick, Ganassi dominate, Ganassi 1-2 photo finish","2":"Late drama with Hamlin leading, spun McDougall back","3":"McDougall spins Wise, finish line crash","7":"Hamlin/McDougall payback","10":"Caution-fest, Allmendinger flip, 2x Big Ones","13":"Logano last lap pass","16":"Eventful, teammate crashes, big hits","17":"2x Big Ones, Ganassi dominate again","19":"Multiple crashes, Kenseth late engine failure, Almirola into playoffs","20":"Logano holds off Ku. Busch, McDougall more trouble","21":"McDougall spin, piled into, Harvick holds off Allmendinger","23":"Elliott engine trouble, Johnson last lap pass on Almirola","28":"Ky. Busch, McDougall late contact","29":"The big one, Newman big crash","30":"Plenty of playoff drama","31":"McDougall/Elliott contraversial contact","32":"Big one #1, Mears flip, Big one #2, McDougall at front, Ragan wins"},"legacyNews":{"Sprint Unlimited/Duels":"Big one, Ku. Busch flip, Dale Jr wins Unlimited, Photo finish in Duel #1 (Kahne, McDougall)","Daytona 500":"Big one Lap 29, Larson flip, Hendrick, Ganassi dominate, Ganassi 1-2 photo finish","Atlanta":"Late drama with Hamlin leading, spun McDougall back","Las Vegas":"McDougall spins Wise, finish line crash","Texas":"Hamlin/McDougall payback","Talladega":"Caution-fest, Allmendinger flip, 2x Big Ones","All Star Race":"Logano wins, Biffle engine causes pile-up","Charlotte":"Logano last lap pass","Sonoma":"Eventful, teammate crashes, big hits","Daytona 2":"2x Big Ones, Ganassi dominate again","New Hampshire":"Multiple crashes, Kenseth late engine failure, Almirola into playoffs","Indianapolis":"Logano holds off Ku. Busch, McDougall more trouble","Pocono 2":"McDougall spin, piled into, Harvick holds off Allmendinger","Bristol 2":"Elliott engine trouble, Johnson last lap pass on Almirola","New Hampshire 2":"Ky. Busch, McDougall late contact","Dover 2":"The big one, Newman big crash","Charlotte 2":"Plenty of playoff drama","Kansas 2":"McDougall/Elliott contraversial contact","Talladega 2":"Big one #1, Mears flip, Big one #2, McDougall at front, Ragan wins"}},"2015":{"year":2015,"schedule":[{"r":1,"code":"DAY","name":"Daytona 500"},{"r":2,"code":"ATL","name":"Atlanta"},{"r":3,"code":"LAS","name":"Las Vegas"},{"r":4,"code":"PHO","name":"Phoenix"},{"r":5,"code":"FON","name":"Fontana"},{"r":6,"code":"MAR","name":"Martinsville"},{"r":7,"code":"TEX","name":"Texas"},{"r":8,"code":"BRI","name":"Bristol"},{"r":9,"code":"RICH","name":"Richmond"},{"r":10,"code":"TALL","name":"Talladega"},{"r":11,"code":"KAN","name":"Kansas"},{"r":12,"code":"CHA","name":"Charlotte"},{"r":13,"code":"DOV","name":"Dover"},{"r":14,"code":"POC","name":"Pocono"},{"r":15,"code":"MCH","name":"Michigan"},{"r":16,"code":"SON","name":"Sonoma"},{"r":17,"code":"DAY","name":"Daytona 2"},{"r":18,"code":"KEN","name":"Kentucky"},{"r":19,"code":"NEW","name":"New Hampshire"},{"r":20,"code":"IND","name":"Indianapolis"},{"r":21,"code":"POC","name":"Pocono 2"},{"r":22,"code":"WAT","name":"Watkins Glen"},{"r":23,"code":"MCH","name":"Michigan 2"},{"r":24,"code":"BRI","name":"Bristol 2"},{"r":25,"code":"DARL","name":"Darlington"},{"r":26,"code":"RICH","name":"Richmond 2"},{"r":27,"code":"CHI","name":"Chicagoland"},{"r":28,"code":"NEW","name":"New Hampshire 2"},{"r":29,"code":"DOV","name":"Dover 2"},{"r":30,"code":"CHA","name":"Charlotte 2"},{"r":31,"code":"KAN","name":"Kansas 2"},{"r":32,"code":"TALL","name":"Talladega 2"},{"r":33,"code":"MAR","name":"Martinsville 2"},{"r":34,"code":"TEX","name":"Texas 2"},{"r":35,"code":"PHO","name":"Phoenix 2"},{"r":36,"code":"HOM","name":"Homestead"}],"drivers":[{"id":"keselowski","num":2,"name":"Keselowski","legacyPoles":0,"legacyBonus":0},{"id":"mcmurray","num":1,"name":"McMurray","legacyPoles":0,"legacyBonus":0},{"id":"hamlin","num":11,"name":"Hamlin","legacyPoles":0,"legacyBonus":0},{"id":"ku-busch","num":41,"name":"Ku. Busch","legacyPoles":0,"legacyBonus":0},{"id":"ky-busch","num":18,"name":"Ky. Busch","legacyPoles":0,"legacyBonus":0},{"id":"truex-jr","num":78,"name":"Truex Jr.","legacyPoles":0,"legacyBonus":0},{"id":"logano","num":22,"name":"Logano","legacyPoles":0,"legacyBonus":0},{"id":"harvick","num":4,"name":"Harvick","legacyPoles":0,"legacyBonus":0},{"id":"johnson","num":48,"name":"Johnson","legacyPoles":0,"legacyBonus":0},{"id":"edwards","num":19,"name":"Edwards","legacyPoles":0,"legacyBonus":0},{"id":"kenseth","num":20,"name":"Kenseth","legacyPoles":0,"legacyBonus":0},{"id":"mcdougall","num":8,"name":"McDougall","legacyPoles":0,"legacyBonus":0},{"id":"larson","num":42,"name":"Larson","legacyPoles":0,"legacyBonus":0},{"id":"kahne","num":5,"name":"Kahne","legacyPoles":0,"legacyBonus":0},{"id":"newman","num":31,"name":"Newman","legacyPoles":0,"legacyBonus":0},{"id":"blaney","num":21,"name":"Blaney","legacyPoles":0,"legacyBonus":0},{"id":"elliott","num":24,"name":"Elliott","legacyPoles":0,"legacyBonus":0},{"id":"allmendinger","num":47,"name":"Allmendinger","legacyPoles":0,"legacyBonus":0},{"id":"almirola","num":43,"name":"Almirola","legacyPoles":0,"legacyBonus":0},{"id":"biffle","num":16,"name":"Biffle","legacyPoles":0,"legacyBonus":0},{"id":"bayne","num":6,"name":"Bayne","legacyPoles":0,"legacyBonus":0},{"id":"stenhouse-jr","num":17,"name":"Stenhouse Jr.","legacyPoles":0,"legacyBonus":0},{"id":"a-dillon","num":3,"name":"A. Dillon","legacyPoles":0,"legacyBonus":0},{"id":"bowyer","num":15,"name":"Bowyer","legacyPoles":0,"legacyBonus":0},{"id":"patrick","num":10,"name":"Patrick","legacyPoles":0,"legacyBonus":0},{"id":"menard","num":27,"name":"Menard","legacyPoles":0,"legacyBonus":0},{"id":"buescher","num":34,"name":"Buescher","legacyPoles":0,"legacyBonus":0},{"id":"scott","num":44,"name":"Scott","legacyPoles":0,"legacyBonus":0},{"id":"stewart","num":14,"name":"Stewart","legacyPoles":0,"legacyBonus":0},{"id":"mears","num":13,"name":"Mears","legacyPoles":0,"legacyBonus":0},{"id":"cassill","num":38,"name":"Cassill","legacyPoles":0,"legacyBonus":0},{"id":"ragan","num":23,"name":"Ragan","legacyPoles":0,"legacyBonus":0},{"id":"annett","num":46,"name":"Annett","legacyPoles":0,"legacyBonus":0},{"id":"earnhardt-jr","num":88,"name":"Earnhardt Jr.","legacyPoles":0,"legacyBonus":0},{"id":"gordon","num":88,"name":"Gordon","legacyPoles":0,"legacyBonus":0},{"id":"smith","num":7,"name":"Smith","legacyPoles":0,"legacyBonus":0},{"id":"dibenedetto","num":93,"name":"DiBenedetto","legacyPoles":0,"legacyBonus":0},{"id":"mcdowell","num":95,"name":"McDowell","legacyPoles":0,"legacyBonus":0},{"id":"t-dillon","num":95,"name":"T. Dillon","legacyPoles":0,"legacyBonus":0},{"id":"gilliland","num":35,"name":"Gilliland","legacyPoles":0,"legacyBonus":0},{"id":"vickers","num":14,"name":"Vickers","legacyPoles":0,"legacyBonus":0},{"id":"gaulding","num":30,"name":"Gaulding","legacyPoles":0,"legacyBonus":0},{"id":"j-earnhardt","num":32,"name":"J. Earnhardt","legacyPoles":0,"legacyBonus":0},{"id":"whitt","num":98,"name":"Whitt","legacyPoles":0,"legacyBonus":0},{"id":"richardson","num":26,"name":"Richardson","legacyPoles":0,"legacyBonus":0},{"id":"hill","num":98,"name":"Hill","legacyPoles":0,"legacyBonus":0},{"id":"b-labonte","num":32,"name":"B. Labonte","legacyPoles":0,"legacyBonus":0},{"id":"sorenson","num":55,"name":"Sorenson","legacyPoles":0,"legacyBonus":0},{"id":"wise","num":30,"name":"Wise","legacyPoles":0,"legacyBonus":0}],"results":{},"poles":{},"mostLaps":{},"news":{}}}},"supercars":{"label":"V8 Supercars","wordmark":["V8 ","SUPERCARS"],"screensLabel":"Supercars","points":{"finish":[150,138,129,120,111,102,96,90,84,81,78,75,72,69,66,63,60,57,54,51,48,45,42,39,36],"dnf":0,"bonusPerMostLaps":0},"chase":{"cutoffRace":27,"fieldSize":10,"seedRule":"points","decideOn":"points","title":"The Finals","tabLabel":"Finals","crown":"Supercars Champion","cups":[{"name":"Sprint Cup","from":1,"to":25,"bonus":25},{"name":"Enduro Cup","from":26,"to":27,"bonus":25}],"rounds":[{"name":"Elimination Final","size":10,"races":[28,29],"base":3000,"advance":7,"seedBonus":[150,120,96,78,66,57,48,39,30,21]},{"name":"Semi Final","size":7,"races":[30,31],"base":4000,"advance":4,"seedBonus":[150,120,96,78,66,57,48]},{"name":"Grand Final","size":4,"races":[32,33,34],"base":5000,"advance":1,"seedBonus":[50,30,15,0]}]},"theme":"supercars","visionPrompt":"These images are PHOTOGRAPHS of a motor racing results screen or timing sheet \u2014 taken with a camera, so expect glare, reflections, screen moire, an off-square angle, motion blur, and parts of the frame out of focus. Read through all of that. If two images overlap, they are the same classification photographed twice or in two parts.\n\nRead every row you can actually see and return the finishing order.\n\nReturn ONLY a JSON array, no preamble, no markdown fences. Each element:\n{\"pos\": <finishing position as an integer>, \"num\": <car number as an integer>, \"name\": \"<driver surname exactly as printed>\", \"dnf\": <true if the row is marked as not finishing \u2014 DNF, DNS, DQ, retired, accident, mechanical, or similar; otherwise false>}\n\nRules:\n- Order by finishing position, ascending, starting at 1.\n- Do not invent rows, and do not guess at a digit you cannot see. If a row is unreadable, leave it out \u2014 a missing row is easy to add by hand, a wrong one is not.\n- If a row appears in more than one image, include it once.\n- Car number is the racing number beside the driver, not the lap count, the gap, the grid position or a time.\n- Ignore anything that is not a classification row: headers, sponsor boards, tickers, the crowd, the track behind the screen.","_todo":["TODO: confirm 2025 grid \u2014 roster is the verified 24-car full-season entry list, but two cars changed hands mid-year and are listed as two drivers each: #3 Love (round 1) then Cameron (rounds 2-13); #62 Stanaway (rounds 1-11) then Ojeda (rounds 12-13). Also, supercars.com's season-opening entry list carried a 25th car, #35 Cameron Crick (Matt Stone Racing), which the spotter's guide and Wikipedia do not list as a full-season entry. You can now fix any of this yourself in Edit season > Field.","NOTE: points.finish is the standard per-race table (150 down to 36 at P25, DNF 0), applied to every race. The two enduros carry mult:2 on their schedule entry and pay double. Any race can be re-weighted the same way in Edit season > Calendar.","NOTE: cups[] are secondary. The championship standings are the main table; Sprint Cup (races 1-25) and Enduro Cup (races 26-27) only buy a guaranteed Finals place and 25 points into round one. If you renumber the calendar, move these ranges with it."],"seasons":{"2025":{"year":2025,"schedule":[{"r":1,"code":"SMP","name":"Sydney R1","round":1,"roundName":"Sydney 500"},{"r":2,"code":"SMP","name":"Sydney R2","round":1,"roundName":"Sydney 500"},{"r":3,"code":"SMP","name":"Sydney R3","round":1,"roundName":"Sydney 500"},{"r":4,"code":"ALB","name":"Melbourne R1","round":2,"roundName":"Melbourne SuperSprint"},{"r":5,"code":"ALB","name":"Melbourne R2","round":2,"roundName":"Melbourne SuperSprint"},{"r":6,"code":"ALB","name":"Melbourne R3","round":2,"roundName":"Melbourne SuperSprint"},{"r":7,"code":"ALB","name":"Melbourne R4","round":2,"roundName":"Melbourne SuperSprint"},{"r":8,"code":"TAU","name":"Taupo R1","round":3,"roundName":"Taupo Super 440"},{"r":9,"code":"TAU","name":"Taupo R2","round":3,"roundName":"Taupo Super 440"},{"r":10,"code":"TAU","name":"Taupo R3","round":3,"roundName":"Taupo Super 440"},{"r":11,"code":"SYM","name":"Tasmania R1","round":4,"roundName":"Tasmania Super 440"},{"r":12,"code":"SYM","name":"Tasmania R2","round":4,"roundName":"Tasmania Super 440"},{"r":13,"code":"SYM","name":"Tasmania R3","round":4,"roundName":"Tasmania Super 440"},{"r":14,"code":"PER","name":"Perth R1","round":5,"roundName":"Perth Super 440"},{"r":15,"code":"PER","name":"Perth R2","round":5,"roundName":"Perth Super 440"},{"r":16,"code":"PER","name":"Perth R3","round":5,"roundName":"Perth Super 440"},{"r":17,"code":"DAR","name":"Darwin R1","round":6,"roundName":"Darwin Triple Crown"},{"r":18,"code":"DAR","name":"Darwin R2","round":6,"roundName":"Darwin Triple Crown"},{"r":19,"code":"DAR","name":"Darwin R3","round":6,"roundName":"Darwin Triple Crown"},{"r":20,"code":"TOW","name":"Townsville R1","round":7,"roundName":"Townsville 500"},{"r":21,"code":"TOW","name":"Townsville R2","round":7,"roundName":"Townsville 500"},{"r":22,"code":"TOW","name":"Townsville R3","round":7,"roundName":"Townsville 500"},{"r":23,"code":"IPS","name":"Ipswich R1","round":8,"roundName":"Ipswich Super 440"},{"r":24,"code":"IPS","name":"Ipswich R2","round":8,"roundName":"Ipswich Super 440"},{"r":25,"code":"IPS","name":"Ipswich R3","round":8,"roundName":"Ipswich Super 440"},{"r":26,"code":"BEND","name":"The Bend 500","round":9,"roundName":"The Bend 500","mult":2},{"r":27,"code":"BATH","name":"Bathurst 1000","round":10,"roundName":"Bathurst 1000","mult":2},{"r":28,"code":"GC","name":"Gold Coast R1","round":11,"roundName":"Gold Coast 500"},{"r":29,"code":"GC","name":"Gold Coast R2","round":11,"roundName":"Gold Coast 500"},{"r":30,"code":"SAN","name":"Sandown R1","round":12,"roundName":"Sandown 500"},{"r":31,"code":"SAN","name":"Sandown R2","round":12,"roundName":"Sandown 500"},{"r":32,"code":"ADL","name":"Adelaide R1","round":13,"roundName":"Adelaide Grand Final"},{"r":33,"code":"ADL","name":"Adelaide R2","round":13,"roundName":"Adelaide Grand Final"},{"r":34,"code":"ADL","name":"Adelaide R3","round":13,"roundName":"Adelaide Grand Final"}],"drivers":[{"id":"brown","num":1,"name":"Brown","legacyPoles":0,"legacyBonus":0},{"id":"wood","num":2,"name":"Wood","legacyPoles":0,"legacyBonus":0},{"id":"love","num":3,"name":"Love","legacyPoles":0,"legacyBonus":0},{"id":"cameron","num":3,"name":"Cameron","legacyPoles":0,"legacyBonus":0},{"id":"hill","num":4,"name":"Hill","legacyPoles":0,"legacyBonus":0},{"id":"waters","num":6,"name":"Waters","legacyPoles":0,"legacyBonus":0},{"id":"courtney","num":7,"name":"Courtney","legacyPoles":0,"legacyBonus":0},{"id":"heimgartner","num":8,"name":"Heimgartner","legacyPoles":0,"legacyBonus":0},{"id":"le-brocq","num":9,"name":"Le Brocq","legacyPoles":0,"legacyBonus":0},{"id":"percat","num":10,"name":"Percat","legacyPoles":0,"legacyBonus":0},{"id":"evans","num":12,"name":"Evans","legacyPoles":0,"legacyBonus":0},{"id":"fullwood","num":14,"name":"Fullwood","legacyPoles":0,"legacyBonus":0},{"id":"davison","num":17,"name":"Davison","legacyPoles":0,"legacyBonus":0},{"id":"de-pasquale","num":18,"name":"De Pasquale","legacyPoles":0,"legacyBonus":0},{"id":"payne","num":19,"name":"Payne","legacyPoles":0,"legacyBonus":0},{"id":"reynolds","num":20,"name":"Reynolds","legacyPoles":0,"legacyBonus":0},{"id":"mostert","num":25,"name":"Mostert","legacyPoles":0,"legacyBonus":0},{"id":"allen","num":26,"name":"Allen","legacyPoles":0,"legacyBonus":0},{"id":"golding","num":31,"name":"Golding","legacyPoles":0,"legacyBonus":0},{"id":"kostecki","num":38,"name":"Kostecki","legacyPoles":0,"legacyBonus":0},{"id":"randle","num":55,"name":"Randle","legacyPoles":0,"legacyBonus":0},{"id":"stanaway","num":62,"name":"Stanaway","legacyPoles":0,"legacyBonus":0},{"id":"ojeda","num":62,"name":"Ojeda","legacyPoles":0,"legacyBonus":0},{"id":"feeney","num":88,"name":"Feeney","legacyPoles":0,"legacyBonus":0},{"id":"jones","num":96,"name":"Jones","legacyPoles":0,"legacyBonus":0},{"id":"murray","num":99,"name":"Murray","legacyPoles":0,"legacyBonus":0}],"results":{},"poles":{},"mostLaps":{},"news":{}}}}};
+/* season:end */
+
+/* ------------------------------------------------------------------
+   scoring.js — the points engine, now series-agnostic.
+
+   POINTS and CHASE are no longer constants; they point at the active
+   series' config in window.DATA and are re-aimed by setSeries(). The
+   arithmetic below is unchanged.
+
+   NASCAR mirrors the original spreadsheet exactly:
+     1st = 50, 2nd = 45, then 47 - position down to 43rd = 4, DNF = 1.
+   Bonus = 1 point per race where the driver led the most laps.
+   Total = sum of finishing points + bonus.
+   (The sheet's old "+5000" on every total was dropped — it added the
+    same number to everyone, so it changed no order and no gap.)
+
+   CHASE is null for a series with no playoff. Everything that reads it
+   checks first; standings themselves never touch it.
+------------------------------------------------------------------ */
+
+let POINTS = null;
+let CHASE = null;
+
+/* The last race number on the calendar — what "the whole season" means
+   for this series. NASCAR is 36; Supercars 2025 is 34. */
+const fullSeason = season => season.schedule.length ? season.schedule[season.schedule.length - 1].r : 0;
+
+/* What one race is worth, relative to the standard table. Lives on the
+   schedule entry, not in the points config, so any single race can be
+   weighted when the calendar changes — Supercars' enduros are `mult: 2`
+   (one long race paying double), and everything else is 1 by omission. */
+const raceMult = (season, r) => season.schedule.find(x => x.r === r)?.mult ?? 1;
+
+function finishPoints(result, mult = 1) {
+  if (result == null) return 0;
+  if (result === 'DNF') return Math.round(POINTS.dnf * mult);
+  const p = POINTS.finish[result - 1];
+  return p == null ? 0 : Math.round(p * mult);
+}
+
+/* Every derived number for one driver across a range of races. */
+function driverStats(season, driver, upTo = Infinity) {
+  const races = season.schedule.filter(r => r.r <= upTo);
+  let starts = 0, wins = 0, top5 = 0, top10 = 0, dnfs = 0, pts = 0;
+
+  for (const race of races) {
+    const res = season.results[race.r]?.[driver.id];
+    if (res == null) continue;
+    starts++;
+    pts += finishPoints(res, race.mult ?? 1);
+    if (res === 'DNF') { dnfs++; continue; }
+    if (res === 1) wins++;
+    if (res <= 5) top5++;
+    if (res <= 10) top10++;
+  }
+
+  /* The legacy carry-over only makes sense against the whole season —
+     mid-season slices (the chase cut, the projection) leave it out. */
+  const whole = upTo >= fullSeason(season);
+  const poles = races.filter(r => season.poles[r.r] === driver.id).length
+                + (whole ? (driver.legacyPoles || 0) : 0);
+  const bonus = races.filter(r => season.mostLaps[r.r] === driver.id).length * POINTS.bonusPerMostLaps
+                + (whole ? (driver.legacyBonus || 0) : 0);
+
+  return { starts, wins, top5, top10, dnfs, poles, bonus, points: pts + bonus };
+}
+
+/* Full standings table, sorted. Ties broken by wins, then top 5s. */
+function standings(season, upTo = Infinity) {
+  const rows = season.drivers
+    .map(d => ({ driver: d, ...driverStats(season, d, upTo) }))
+    .filter(r => r.starts > 0 || r.points > 0);
+
+  rows.sort((a, b) =>
+    b.points - a.points || b.wins - a.wins || b.top5 - a.top5 ||
+    a.driver.name.localeCompare(b.driver.name));
+
+  const leader = rows[0]?.points ?? 0;
+  rows.forEach((r, i) => {
+    r.rank = i + 1;
+    r.behind = i === 0 ? null : r.points - leader;
+  });
+  return rows;
+}
+
+/* Has the season reached a given race yet? */
+function raceRun(season, r) {
+  return Object.keys(season.results[r] || {}).length > 0;
+}
+
+/* Seed the field as of a given race: winners first (by wins, then points),
+   everyone else on points, top 16. Same rule the regular-season projection
+   and the locked field both use — the only difference is how far in we are. */
+/* A sub-championship run over a slice of the calendar — Supercars'
+   Sprint Cup (the sprint rounds) and Enduro Cup (Bathurst and The Bend).
+   Winning one buys a guaranteed Finals place and a points head start.
+   Returns [] for a series that doesn't have any. */
+function cupWinners(season, upTo) {
+  const out = [];
+  for (const cup of CHASE.cups || []) {
+    if (cup.to > upTo) continue;                 /* not settled yet */
+    const races = season.schedule.filter(r => r.r >= cup.from && r.r <= cup.to);
+    let best = null, bestPts = -1;
+    for (const d of season.drivers) {
+      let pts = 0, ran = false;
+      for (const race of races) {
+        const res = season.results[race.r]?.[d.id];
+        if (res == null) continue;
+        ran = true;
+        pts += finishPoints(res, race.mult ?? 1);
+      }
+      if (ran && pts > bestPts) { bestPts = pts; best = d; }
+    }
+    if (best) out.push({ id: best.id, cup: cup.name, bonus: cup.bonus || 0 });
+  }
+  return out;
+}
+
+/* Seed the field as of a given race. Two rules, picked by config:
+
+   'points' (Supercars) — the top N on points, except that a cup winner
+   is in whether or not they made the cut. Seeding order is points.
+
+   default (NASCAR) — winners first (by wins, then points), everyone
+   else on points, top 16. Same rule the regular-season projection and
+   the locked field both use; the only difference is how far in we are. */
+function seedField(season, upTo) {
+  const reg = standings(season, upTo);
+  const size = CHASE.fieldSize;
+  let field;
+
+  if (CHASE.seedRule === 'points') {
+    const cups = cupWinners(season, upTo);
+    const auto = new Set(cups.map(c => c.id));
+    field = [...reg.filter(r => auto.has(r.driver.id)), ...reg.filter(r => !auto.has(r.driver.id))]
+      .slice(0, size)
+      .sort((a, b) => b.points - a.points || b.wins - a.wins);
+
+    return field.map((r, i) => ({
+      id: r.driver.id, driver: r.driver, seed: i + 1,
+      regWins: r.wins, regPoints: r.points, onBubble: !auto.has(r.driver.id),
+      cups: cups.filter(c => c.id === r.driver.id),
+    }));
+  }
+
+  const winners = reg.filter(r => r.wins > 0)
+    .sort((a, b) => b.wins - a.wins || b.points - a.points);
+  const rest = reg.filter(r => r.wins === 0);
+  field = [...winners, ...rest].slice(0, size);
+
+  return field.map((r, i) => ({
+    id: r.driver.id, driver: r.driver, seed: i + 1,
+    regWins: r.wins, regPoints: r.points, onBubble: r.wins === 0, cups: [],
+  }));
+}
+
+/* How far the season has actually run. */
+function racesRun(season) {
+  return season.schedule.filter(r => raceRun(season, r.r)).length;
+}
+
+/* ------------------------------------------------------------------
+   Chase grid — 2016 format.
+
+   Before race 26 this returns a live PROJECTION: the field as it would
+   stand if the regular season ended today, re-seeded after every race.
+   At race 26 that field LOCKS. From 27 on the bracket runs: each round
+   resets to a base plus 3 per regular-season win, a win auto-advances,
+   and the field cuts 16 -> 12 -> 8 -> 4 -> champion.
+------------------------------------------------------------------ */
+function chaseGrid(season) {
+  if (!CHASE) return null;
+  const run = racesRun(season);
+  if (run === 0) return null;
+
+  const locked = raceRun(season, CHASE.cutoffRace);
+
+  /* Regular season: project the field, no bracket yet. */
+  if (!locked) {
+    return {
+      projected: true,
+      run,
+      remaining: CHASE.cutoffRace - run,
+      regular: seedField(season, run),
+      rounds: [],
+    };
+  }
+
+  const seeds = seedField(season, CHASE.cutoffRace);
+
+  const grid = { regular: seeds, rounds: [] };
+  let alive = seeds.map(s => s.id);
+  let stop = false;
+
+  CHASE.rounds.forEach((round, ri) => {
+    if (stop) return;
+    const run = round.races.filter(r => raceRun(season, r));
+
+    /* Two ways a round can hand out its head start.
+
+       seedBonus (Supercars) — a ladder paid by position ENTERING this
+       round, so the field re-seeds after every cut. Round one also pays
+       the cup bonuses.
+
+       seedBonusPerWin (NASCAR) — flat base plus N per regular-season
+       win, the same every round. */
+    const headStart = (s, i) => {
+      if (round.seedBonus) {
+        return (round.seedBonus[i] ?? 0)
+          + (ri === 0 ? s.cups.reduce((n, c) => n + c.bonus, 0) : 0);
+      }
+      return s.regWins * (CHASE.seedBonusPerWin || 0);
+    };
+
+    const entries = alive.map((id, i) => {
+      const s = seeds.find(x => x.id === id);
+      let pts = round.base + headStart(s, i);
+      let wonInRound = false;
+      for (const r of run) {
+        const res = season.results[r]?.[id];
+        pts += finishPoints(res, raceMult(season, r));
+        if (res === 1) wonInRound = true;
+      }
+      return { ...s, points: pts, wonInRound };
+    });
+
+    entries.sort((a, b) => b.points - a.points || a.seed - b.seed);
+
+    const complete = run.length === round.races.length;
+    if (complete && round.advance < entries.length) {
+      const auto = entries.filter(e => e.wonInRound).map(e => e.id);
+      const onPoints = entries.filter(e => !auto.includes(e.id))
+        .slice(0, Math.max(0, round.advance - auto.length)).map(e => e.id);
+      const next = new Set([...auto, ...onPoints]);
+      entries.forEach(e => { e.eliminated = !next.has(e.id); });
+      alive = entries.filter(e => !e.eliminated).map(e => e.id);
+    } else {
+      entries.forEach(e => { e.eliminated = false; });
+    }
+
+    grid.rounds.push({ name: round.name, size: round.size, races: round.races, complete, entries });
+    if (!complete) stop = true;
+  });
+
+  /* Who takes the title out of the last round. Supercars counts points
+     across all three Adelaide races; NASCAR's Championship 4 is decided
+     on best finish at Homestead, points be damned. */
+  const final = grid.rounds[grid.rounds.length - 1];
+  const finaleRace = CHASE.rounds[CHASE.rounds.length - 1].races.at(-1);
+
+  if (final?.complete && CHASE.decideOn === 'points') {
+    final.entries.forEach((e, i) => { e.eliminated = i > 0; });   /* already points-sorted */
+    grid.champion = final.entries[0];
+  } else if (final?.name === 'Championship' && final.complete) {
+    const order = final.entries.map(e => {
+      const res = season.results[finaleRace]?.[e.id];
+      return { ...e, finale: res === 'DNF' || res == null ? 99 : res };
+    }).sort((a, b) => a.finale - b.finale);
+    order.forEach((e, i) => { e.eliminated = i > 0; });
+    final.entries = order;
+    grid.champion = order[0];
+  }
+
+  return grid;
+}
+
+/* ------------------------------------------------------------------
+   storage.js — three layers now.
+
+   1. Supabase: where the seasons actually live, keyed by your account.
+      The app will not open without a session, so there is one copy of
+      the truth and no merge to get wrong.
+   2. localStorage: the two secrets ONLY — your Anthropic key and your
+      GitHub token. Those never leave the browser they were typed into,
+      which is what the Settings copy has always promised. You enter
+      them once per machine.
+   3. GitHub: unchanged. Commit still rewrites the data block inside
+      this file so the seasons stay in version control too.
+
+   The cloud rows sit in `predictor_state`, the table the Ladder
+   Predictor already uses, with every key here carrying a `tracker_`
+   prefix so the two apps cannot tread on each other.
+
+   `store` deliberately wears localStorage's interface — synchronous
+   getItem/setItem over an in-memory cache, with the write debounced out
+   to Supabase behind it. That is what let the rest of the app keep
+   reading and writing storage exactly as it did before.
+------------------------------------------------------------------ */
+
+const SUPABASE_URL = 'https://pkylungddcizffdtnmhd.supabase.co';
+const SUPABASE_ANON_KEY = 'sb_publishable_jw0reggu8JnnZaI1BtRe9g_vqGjh7u1';
+const CLOUD_TABLE = 'predictor_state';
+const CLOUD_PREFIX = 'tracker_';
+const PUSH_DEBOUNCE = 400;
+
+const sb = window.supabase?.createClient(SUPABASE_URL, SUPABASE_ANON_KEY) || null;
+
+const cloudCache = {};
+const cloudTimers = {};
+let userId = null;
+
+const LS = {
+  /* cloud keys — the prefix is added on the way out */
+  data: 'data',
+  series: 'series',
+  year: 'year',
+
+  /* device-local, never synced */
+  apiKey: 'nr2003.anthropicKey',
+  gh: 'nr2003.github',
+
+  /* read once, on the way in, and then left alone */
+  localData: 'tracker.data',
+  localSeries: 'tracker.series',
+  localYear: 'tracker.year',
+  oldSeasons: 'nr2003.seasons',
+  oldYear: 'nr2003.year',
+};
+
+function setSync(text, cls) {
+  const el = $('sync');
+  if (!el) return;
+  el.textContent = text;
+  el.className = 'sync' + (cls ? ' ' + cls : '');
+}
+
+const store = {
+  getItem(key) {
+    const k = CLOUD_PREFIX + key;
+    return Object.prototype.hasOwnProperty.call(cloudCache, k) ? cloudCache[k] : null;
+  },
+  setItem(key, value) {
+    const k = CLOUD_PREFIX + key;
+    cloudCache[k] = String(value);
+    clearTimeout(cloudTimers[k]);
+    cloudTimers[k] = setTimeout(() => pushKey(k), PUSH_DEBOUNCE);
+    setSync('Saving', 'busy');
+  },
+};
+
+async function pushKey(k) {
+  delete cloudTimers[k];
+  if (!userId || !sb) return;
+  let value;
+  try { value = JSON.parse(cloudCache[k]); }
+  catch (e) { console.warn('Refusing to push unparseable value for', k, e); return; }
+
+  const { error } = await sb.from(CLOUD_TABLE).upsert({
+    user_id: userId, key: k, value, updated_at: new Date().toISOString(),
+  });
+  if (error) {
+    setSync('Not saved', 'err');
+    console.error('Cloud save failed for', k, error);
+    toast(`Couldn't save to the cloud: ${error.message}`, true);
+    return;
+  }
+  if (!Object.keys(cloudTimers).length) setSync('Saved', 'ok');
+}
+
+/* Anything still inside its debounce when the tab goes away would be
+   lost, and cloud-only means there is no local copy to fall back on.
+   Push everything outstanding the moment the tab is hidden, and hold
+   the close if a write is genuinely still in flight. */
+function flushPending() {
+  for (const k of Object.keys(cloudTimers)) {
+    clearTimeout(cloudTimers[k]);
+    pushKey(k);
+  }
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') flushPending();
+});
+window.addEventListener('beforeunload', e => {
+  if (!Object.keys(cloudTimers).length) return;
+  flushPending();
+  e.preventDefault();
+  e.returnValue = '';
+});
+
+async function loadCloud(uid) {
+  const { data: rows, error } = await sb.from(CLOUD_TABLE)
+    .select('key,value').eq('user_id', uid).like('key', `${CLOUD_PREFIX}%`);
+  if (error) throw new Error(error.message);
+  for (const row of rows) cloudCache[row.key] = JSON.stringify(row.value);
+  return rows.length;
+}
+
+/* --- what was here before ----------------------------------------- */
+
+const readLocal = key => {
+  try { return JSON.parse(localStorage.getItem(key) || 'null'); }
+  catch (e) { console.warn(`${key} unreadable, ignoring it.`, e); return null; }
+};
+const readJSON = key => {
+  try { return JSON.parse(store.getItem(key) || 'null'); }
+  catch (e) { console.warn(`${key} unreadable, ignoring it.`, e); return null; }
+};
+
+/* First sign-in on a machine that already has seasons in this browser:
+   lift them into the cloud rather than showing an empty tracker next to
+   a full localStorage. Runs only when the account has nothing yet, and
+   never deletes the local copy — it stays put as a backup. */
+function migrateLocalToCloud() {
+  if (store.getItem(LS.data)) return null;      /* the account already has seasons */
+
+  const local = readLocal(LS.localData);
+  if (local && Object.keys(local).length) {
+    store.setItem(LS.data, JSON.stringify(local));
+    const sk = localStorage.getItem(LS.localSeries);
+    if (sk) store.setItem(LS.series, JSON.stringify(sk));
+    const ym = readLocal(LS.localYear);
+    if (ym) store.setItem(LS.year, JSON.stringify(ym));
+    return LS.localData;
+  }
+
+  /* Older still: the single-series build, before there was a Supercars. */
+  const legacy = readLocal(LS.oldSeasons);
+  if (legacy && Object.keys(legacy).length) {
+    store.setItem(LS.data, JSON.stringify({ nascar: legacy }));
+    const oy = localStorage.getItem(LS.oldYear);
+    if (oy) store.setItem(LS.year, JSON.stringify({ nascar: oy }));
+    return LS.oldSeasons;
+  }
+  return null;
+}
+
+/* Saved years win; any year only in the file gets seeded in alongside.
+   Series the file doesn't define are ignored — the file is the schema. */
+function loadData(seed) {
+  const out = structuredClone(seed);
+  const saved = readJSON(LS.data);
+  if (saved) {
+    for (const key of Object.keys(out)) {
+      if (saved[key] && typeof saved[key] === 'object') Object.assign(out[key].seasons, saved[key]);
+    }
+  }
+  return out;
+}
+
+function saveLocal(data) {
+  const slim = {};
+  for (const key of Object.keys(data)) slim[key] = data[key].seasons;
+  store.setItem(LS.data, JSON.stringify(slim));
+  return true;
+}
+
+function resetSeason(data, seed, seriesKey, year) {
+  data[seriesKey].seasons[year] = structuredClone(seed[seriesKey].seasons[year]);
+  saveLocal(data);
+  return data;
+}
+
+const getSeries = fallback => readJSON(LS.series) || fallback;
+const setSeries = k => store.setItem(LS.series, JSON.stringify(k));
+
+/* Each series remembers its own year — NASCAR sits on 2016 while
+   Supercars sits on 2025, and switching back and forth keeps both. */
+const getYear = (seriesKey, fallback) => (readJSON(LS.year) || {})[seriesKey] || fallback;
+const setYear = (seriesKey, y) => {
+  const map = readJSON(LS.year) || {};
+  map[seriesKey] = y;
+  store.setItem(LS.year, JSON.stringify(map));
+};
+
+/* --- settings ---------------------------------------------------- */
+
+/* These two are the exception: real localStorage, this device only. */
+const getApiKey = () => localStorage.getItem(LS.apiKey) || '';
+const setApiKey = k => k ? localStorage.setItem(LS.apiKey, k) : localStorage.removeItem(LS.apiKey);
+
+function getGitHub() {
+  try { return JSON.parse(localStorage.getItem(LS.gh)) || {}; } catch { return {}; }
+}
+const setGitHub = cfg => localStorage.setItem(LS.gh, JSON.stringify(cfg));
+
+/* --- GitHub write-back -------------------------------------------
+   Everything lives in index.html, so a commit rewrites the data block
+   inside this very file — every series, every season, in one write.
+   The sentinels below mark it out.
+
+   Needs a fine-grained personal access token with Contents: Read and
+   write, scoped to this one repository and nothing else.
+------------------------------------------------------------------ */
+
+const SEASON_START = '/* season:start */';
+const SEASON_END = '/* season:end */';
+
+const b64encode = str => btoa(String.fromCharCode(...new TextEncoder().encode(str)));
+const b64decode = str => new TextDecoder().decode(
+  Uint8Array.from(atob(str.replace(/\s/g, '')), c => c.charCodeAt(0)));
+
+async function ghRequest(cfg, path, opts = {}) {
+  const res = await fetch(`https://api.github.com/repos/${cfg.owner}/${cfg.repo}/contents/${path}`, {
+    ...opts,
+    headers: {
+      Authorization: `Bearer ${cfg.token}`,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      ...(opts.headers || {}),
+    },
+  });
+  return res;
+}
+
+async function commitSeasons(data, seriesKey, year) {
+  const cfg = getGitHub();
+  if (!cfg.token || !cfg.owner || !cfg.repo) {
+    throw new Error('Add your repository and token in Settings before committing.');
+  }
+  const branch = cfg.branch || 'main';
+  const path = cfg.path || 'index.html';
+
+  const head = await ghRequest(cfg, `${path}?ref=${encodeURIComponent(branch)}`);
+  if (!head.ok) {
+    throw new Error(head.status === 404
+      ? `${path} isn't on branch ${branch}. Push it first, then commit.`
+      : `GitHub returned ${head.status} reading ${path}.`);
+  }
+  const meta = await head.json();
+  const html = b64decode(meta.content);
+
+  const a = html.indexOf(SEASON_START);
+  const b = html.indexOf(SEASON_END);
+  if (a === -1 || b === -1 || b < a) {
+    throw new Error(`Couldn't find the season block in ${path}. Nothing was written.`);
+  }
+
+  const payload = `${SEASON_START}\nwindow.DATA = ${JSON.stringify(data)};\n${SEASON_END}`;
+  const next = html.slice(0, a) + payload + html.slice(b + SEASON_END.length);
+
+  const put = await ghRequest(cfg, path, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      message: `${data[seriesKey].label} ${year}: through race ${lastRaceRun(data[seriesKey].seasons[year]) || 0}`,
+      content: b64encode(next),
+      branch,
+      sha: meta.sha,
+    }),
+  });
+
+  if (!put.ok) {
+    const body = await put.json().catch(() => ({}));
+    throw new Error(body.message || `GitHub returned ${put.status}.`);
+  }
+  return (await put.json()).commit.sha.slice(0, 7);
+}
+
+function lastRaceRun(season) {
+  let last = 0;
+  for (const r of season.schedule) if (raceRun(season, r.r)) last = r.r;
+  return last;
+}
+
+/* --- file export, for when you'd rather commit by hand ----------- */
+
+function downloadSeason(season) {
+  const blob = new Blob([JSON.stringify(season, null, 1)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `${season.year}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function importSeason(file) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => {
+      try { resolve(JSON.parse(fr.result)); }
+      catch { reject(new Error("That file isn't valid season JSON.")); }
+    };
+    fr.onerror = () => reject(new Error("Couldn't read that file."));
+    fr.readAsText(file);
+  });
+}
+
+/* ------------------------------------------------------------------
+   vision.js — turn photos of a results screen into rows.
+   Calls the Anthropic API straight from the browser. Your key lives in
+   localStorage on this machine; it is never committed to the repo.
+
+   The prompt is per-series: each series carries its own visionPrompt in
+   the data block, because "the results screen" means a different thing
+   in each. NASCAR describes the NR2003 screen exactly. Supercars falls
+   back to a generic classification reader until we know what the source
+   looks like — see the _todo in the data.
+
+   Nothing here is load-bearing: manual entry works for every series
+   whether or not a key is set.
+------------------------------------------------------------------ */
+
+const VISION_MODEL = 'claude-sonnet-5';
+
+const FALLBACK_PROMPT = `Read the finishing order from this race results image.
+
+Return ONLY a JSON array, no preamble, no markdown fences. Each element:
+{"pos": <finishing position as an integer>, "num": <car number as an integer>, "name": "<driver surname exactly as printed>", "dnf": <true if the row is marked as not finishing; otherwise false>}
+
+Order by finishing position, ascending, starting at 1. Do not invent rows.`;
+
+async function fileToPart(file) {
+  const data = await new Promise((res, rej) => {
+    const fr = new FileReader();
+    fr.onload = () => res(fr.result.split(',')[1]);
+    fr.onerror = () => rej(new Error(`Couldn't read ${file.name}.`));
+    fr.readAsDataURL(file);
+  });
+  return { type: 'image', source: { type: 'base64', media_type: file.type, data } };
+}
+
+async function readResults(files, prompt) {
+  const key = getApiKey();
+  if (!key) throw new Error('Add your Anthropic API key in Settings to read screenshots.');
+  if (!files.length) throw new Error('Add at least one screenshot first.');
+
+  const parts = [];
+  for (const f of files) parts.push(await fileToPart(f));
+  parts.push({ type: 'text', text: prompt || FALLBACK_PROMPT });
+
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'x-api-key': key,
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json',
+      'anthropic-dangerous-direct-browser-access': 'true',
+    },
+    body: JSON.stringify({
+      model: VISION_MODEL,
+      max_tokens: 4000,
+      messages: [{ role: 'user', content: parts }],
+    }),
+  });
+
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error?.message || `The API returned ${res.status}.`);
+  }
+
+  const data = await res.json();
+  const text = data.content.filter(c => c.type === 'text').map(c => c.text).join('');
+  const clean = text.replace(/```json/g, '').replace(/```/g, '').trim();
+
+  let rows;
+  try { rows = JSON.parse(clean); }
+  catch { throw new Error("Couldn't make sense of the results screen. Try a sharper screenshot, or enter this one by hand."); }
+  if (!Array.isArray(rows)) throw new Error('The results came back in an unexpected shape.');
+
+  return rows.sort((a, b) => a.pos - b.pos);
+}
+
+/* ------------------------------------------------------------------
+   Match a read row to a driver on the active series' roster — callers
+   pass season.drivers, so it follows whichever series is showing.
+
+   Car numbers repeat across a roster (NASCAR 2016 has two 88s, two 95s
+   and two 98s; the Supercars roster shares #3 and #62 between the two
+   drivers who raced them), so the number narrows the field and the name
+   settles it.
+------------------------------------------------------------------ */
+
+const norm = s => String(s || '').toLowerCase().replace(/[^a-z]/g, '');
+
+function editDistance(a, b) {
+  const dp = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]);
+  for (let j = 0; j <= b.length; j++) dp[0][j] = j;
+  for (let i = 1; i <= a.length; i++)
+    for (let j = 1; j <= b.length; j++)
+      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1,
+        dp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+  return dp[a.length][b.length];
+}
+
+function matchDriver(row, drivers) {
+  const target = norm(row.name);
+  let best = null, bestScore = -Infinity;
+
+  for (const d of drivers) {
+    const name = norm(d.name);
+    let score = 0;
+    if (row.num != null && d.num === row.num) score += 4;
+    if (name === target) score += 6;
+    else if (target && (name.includes(target) || target.includes(name))) score += 3;
+    else if (target) {
+      const dist = editDistance(name, target);
+      const near = 1 - dist / Math.max(name.length, target.length);
+      score += near > 0.6 ? near * 3 : -2;
+    }
+    if (score > bestScore) { bestScore = score; best = d; }
+  }
+  return bestScore >= 3 ? best : null;
+}
+
+/* ------------------------------------------------------------------
+   app.js — render and wiring.
+------------------------------------------------------------------ */
+
+const SEED = window.DATA;
+
+/* Nothing here can be filled in until the cloud has answered, so the
+   whole lot stays empty until boot() runs. Everything below reads these
+   five; setSeries2() re-aims them together and nothing else may move
+   them. */
+let data = null;
+let SERIES_KEYS = [];
+let seriesKey = null;
+let series = null;
+let YEARS = [];
+let year = null;
+let season = null;
+
+let openRace = null;
+let shots = [];
+
+/* Point the whole app at one series. Named with the 2 because
+   setSeries() is the localStorage writer up in storage.js. */
+function setSeries2(key, remember = true) {
+  if (!data[key]) return;
+  seriesKey = key;
+  series = data[key];
+
+  YEARS = Object.keys(series.seasons).sort().reverse();
+  useSeason(YEARS.includes(getYear(key)) ? getYear(key) : YEARS[0], false);
+
+  if (remember) setSeries(key);
+}
+
+/* Point the app at one season of the active series.
+
+   A season may carry its own `points` and `chase`; where it doesn't,
+   the series defaults apply. That is what makes a second year safe —
+   2026 can run a different calendar, a different table and a different
+   bracket without disturbing 2025. */
+function useSeason(y, remember = true) {
+  if (!series.seasons[y]) y = YEARS[0];
+  year = y;
+  season = series.seasons[y];
+  POINTS = season.points || series.points;
+  CHASE = season.chase ?? series.chase ?? null;
+  if (remember) setYear(seriesKey, year);
+  applySeriesChrome();
+}
+
+/* The bits of the page that carry the series' identity. */
+function applySeriesChrome() {
+  document.body.dataset.series = series.theme || seriesKey;
+  document.title = `${series.label} · Season`;
+
+  const wm = $('wordmark');
+  wm.replaceChildren();
+  const [lead, accent] = series.wordmark || [series.label, ''];
+  wm.append(document.createTextNode(lead));
+  if (accent) wm.append(el('span', null, accent));
+
+  for (const btn of $('series-tabs').children) {
+    btn.setAttribute('aria-selected', String(btn.dataset.series === seriesKey));
+    btn.tabIndex = btn.dataset.series === seriesKey ? 0 : -1;
+  }
+
+  /* No playoff, no Chase tab — and never leave the user stranded on a
+     view that just disappeared. */
+  const hasChase = !!CHASE;
+  $('tab-chase').hidden = !hasChase;
+  if (hasChase) {
+    $('chase-title').textContent = CHASE.title || 'The Chase Grid';
+    $('tab-chase').textContent = CHASE.tabLabel || 'Chase grid';
+  }
+  if (!hasChase || $('tab-standings').getAttribute('aria-selected') === 'true') selectTab('standings');
+}
+
+const $ = id => document.getElementById(id);
+const el = (tag, cls, txt) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (txt != null) n.textContent = txt;
+  return n;
+};
+const driverById = id => season.drivers.find(d => d.id === id);
+
+function toast(msg, isErr) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.className = 'toast' + (isErr ? ' err' : '');
+  t.hidden = false;
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => { t.hidden = true; }, 3200);
+}
+
+function persist() { saveLocal(data); render(); }
+
+/* --- schedule strip ----------------------------------------------- */
+
+/* Consecutive races sharing a round number, as [{round, name, races}].
+   A schedule with no round field comes back as one nameless group,
+   which is exactly the ungrouped strip NASCAR has always drawn. */
+function roundGroups(schedule) {
+  if (!schedule.some(r => r.round != null)) return [{ round: null, name: null, races: schedule }];
+  const out = [];
+  for (const race of schedule) {
+    const last = out[out.length - 1];
+    if (last && last.round === race.round) last.races.push(race);
+    else out.push({ round: race.round, name: race.roundName || null, races: [race] });
+  }
+  return out;
+}
+
+function raceChip(race, last) {
+  const done = raceRun(season, race.r);
+  const chip = el('button', 'race-chip' + (done ? ' done' : '') + (race.r === last + 1 ? ' next' : ''));
+  chip.append(el('span', 'rn', 'R' + race.r), el('span', 'rc', race.code));
+  if (race.mult && race.mult !== 1) chip.append(el('span', 'mult', `\u00d7${race.mult}`));
+  const worth = race.mult && race.mult !== 1 ? ` — ${race.mult}\u00d7 points` : '';
+  chip.title = (race.roundName ? `${race.roundName} — ${race.name}` : race.name) + worth;
+  chip.setAttribute('aria-label', `Race ${race.r}, ${race.name}`);
+  chip.onclick = () => showRace(race.r);
+  return chip;
+}
+
+function renderStrip() {
+  const strip = $('strip');
+  strip.replaceChildren();
+  const last = lastRaceRun(season);
+  const groups = roundGroups(season.schedule);
+  const grouped = groups.length > 1 || groups[0].round != null;
+  strip.classList.toggle('grouped', grouped);
+
+  if (!grouped) {
+    for (const race of groups[0].races) strip.append(raceChip(race, last));
+  } else {
+    for (const g of groups) {
+      const box = el('div', 'round-group');
+      box.append(el('div', 'rg-lbl', g.name || `Round ${g.round}`));
+      const row = el('div', 'rg-races');
+      for (const race of g.races) row.append(raceChip(race, last));
+      box.append(row);
+      strip.append(box);
+    }
+  }
+  $('season-tag').textContent = `R${last}/${season.schedule.length}`;
+}
+
+/* --- standings ---------------------------------------------------- */
+
+const STAT_COLS = [
+  ['Starts', 'starts'], ['Wins', 'wins'], ['Top 5', 'top5'],
+  ['Top 10', 'top10'], ['DNF', 'dnfs'], ['Poles', 'poles'], ['Bonus', 'bonus'],
+];
+
+function cellClass(res) {
+  if (res == null) return 'cell empty';
+  if (res === 'DNF') return 'cell p-dnf';
+  if (res === 1) return 'cell p-win';
+  if (res <= 5) return 'cell p-t5';
+  if (res <= 10) return 'cell p-t10';
+  return 'cell p-run';
+}
+
+function renderStandings() {
+  const table = $('standings-table');
+  table.replaceChildren();
+
+  const thead = el('thead');
+  const hr = el('tr');
+  hr.append(th('Rnk', 'c-rank'), th('#', 'c-num'), th('Driver', 'c-driver'));
+
+  const roundStarts = new Set(roundGroups(season.schedule)
+    .filter(g => g.round != null).slice(1).map(g => g.races[0].r));
+
+  for (const race of season.schedule) {
+    const h = el('th', 'race-h' + (roundStarts.has(race.r) ? ' round-start' : ''));
+    h.append(el('span', 'rn', 'R' + race.r), document.createTextNode(race.code));
+    if (race.mult && race.mult !== 1) h.append(el('span', 'mult', `\u00d7${race.mult}`));
+    const worth = race.mult && race.mult !== 1 ? ` — ${race.mult}\u00d7 points` : '';
+    h.title = (race.roundName ? `${race.roundName} — ${race.name}` : race.name) + worth;
+    h.onclick = () => showRace(race.r);
+    hr.append(h);
+  }
+  for (const [label] of STAT_COLS) hr.append(th(label, 'stat'));
+  hr.append(th('Pts', 'c-pts'), th('Behind', 'c-behind'));
+  thead.append(hr);
+
+  const tbody = el('tbody');
+  const rows = standings(season);
+
+  if (!rows.length) {
+    table.append(thead);
+    return;
+  }
+
+  for (const row of rows) {
+    const tr = el('tr');
+    tr.append(td(row.rank, 'c-rank'), td(row.driver.num ?? '', 'c-num'), td(row.driver.name, 'c-driver'));
+
+    for (const race of season.schedule) {
+      const res = season.results[race.r]?.[row.driver.id];
+      const cell = td(res == null ? '·' : res === 'DNF' ? 'DNF' : res,
+        cellClass(res) + (roundStarts.has(race.r) ? ' round-start' : ''));
+      cell.onclick = () => showRace(race.r);
+      cell.style.cursor = 'pointer';
+      tr.append(cell);
+    }
+    for (const [label, key] of STAT_COLS) {
+      const v = row[key];
+      tr.append(td(v, 'stat' + (key === 'wins' && v > 0 ? ' wins' : '') + (v === 0 ? ' zero' : '')));
+    }
+    tr.append(td(row.points, 'c-pts'));
+    tr.append(td(row.behind == null ? 'LEADER' : row.behind, 'c-behind' + (row.behind == null ? ' leader' : '')));
+    tbody.append(tr);
+  }
+
+  table.append(thead, tbody);
+  pinColumns(table);
+}
+
+/* The browser sizes table columns from their content, not from the width we
+   ask for, so measure what it actually did and pin the frozen columns to
+   that. Otherwise the grid shows through the gaps when you scroll. */
+function pinColumns(table) {
+  const tr = table.querySelector('tbody tr');
+  if (!tr) return;
+  const w = cls => tr.querySelector('.' + cls)?.getBoundingClientRect().width || 0;
+  const rank = w('c-rank'), num = w('c-num'), behind = w('c-behind');
+  table.style.setProperty('--pin-num', rank + 'px');
+  table.style.setProperty('--pin-driver', rank + num + 'px');
+  table.style.setProperty('--pin-pts', behind + 'px');
+}
+
+const th = (t, c) => el('th', c, t);
+const td = (t, c) => el('td', c, String(t));
+
+/* --- chase grid --------------------------------------------------- */
+
+/* "Chicagoland / New Hampshire / Dover" — straight off the schedule.
+   A series with rounds names the round once rather than once per race,
+   so Adelaide R1/R2/R3 reads "Adelaide Grand Final", not three times. */
+const roundTracks = races => {
+  const names = races.map(r => {
+    const race = season.schedule.find(x => x.r === r);
+    if (!race) return null;
+    return race.roundName || race.name.replace(/ \d$/, '');
+  }).filter(Boolean);
+  return [...new Set(names)].join(' / ');
+};
+
+function slot(entry, meta) {
+  const li = el('li', 'slot' +
+    (entry.eliminated ? ' out' : '') +
+    (entry.wonInRound ? ' won' : '') +
+    (entry.champion ? ' champion' : ''));
+
+  const car = el('span', 'car', entry.driver.num ?? '–');
+  if (entry.driver.color && !entry.eliminated) car.style.color = entry.driver.color;
+  li.append(car, el('span', 'nm', entry.driver.name), el('span', 'meta', meta));
+  return li;
+}
+
+function badge(name, size) {
+  const b = el('div', 'badge');
+  b.append(el('div', 'stripes'));
+  const lbl = el('div', 'lbl');
+  const span = el('span', null, name);
+  span.append(el('em', null, size));
+  lbl.append(span);
+  b.append(lbl);
+  return b;
+}
+
+function renderChase() {
+  const body = $('chase-body');
+  body.replaceChildren();
+  if (!CHASE) { body.replaceChildren(); return; }   /* series has no playoff */
+
+  const gaps = chaseGaps(season);
+  if (gaps.length) {
+    const warn = el('div', 'chase-warn');
+    warn.append(el('strong', null, 'The bracket and the calendar disagree'));
+    warn.append(document.createTextNode(
+      `It is set up around ${gaps.length === 1 ? 'race' : 'races'} ${gaps.join(', ')}, `
+      + `which the calendar no longer has — this season runs to race ${fullSeason(season)}. `
+      + `Nothing below will be right until the two line up.`));
+    body.append(warn);
+  }
+
+  const grid = chaseGrid(season);
+
+  if (!grid) {
+    const e = el('div', 'empty-state');
+    e.append(el('strong', null, 'No races run yet'));
+    e.append(document.createTextNode('The projected field appears here from race 1.'));
+    body.append(e);
+    return;
+  }
+
+  /* Regular season — a single projected field, re-seeded every race. */
+  if (grid.projected) {
+    const wrap = el('div', 'chase');
+    const col = el('div', 'round projected');
+
+    const head = el('div', 'round-tracks');
+    head.textContent = grid.remaining > 0
+      ? `Projected field · locks in ${grid.remaining} ${grid.remaining === 1 ? 'race' : 'races'}`
+      : 'Projected field · locks after this race';
+    col.append(head);
+
+    const ol = el('ol', 'ladder');
+    grid.regular.forEach((s, i) => {
+      const cutoff = i === CHASE.fieldSize - 1;
+      /* The championship is the main event, so championship points are
+         what the slot reads. A clinched cup is a footnote on top of it:
+         it locks the place, it doesn't replace the number. */
+      const meta = (CHASE.seedRule !== 'points' && s.regWins > 0) ? `${s.regWins}W` : s.regPoints;
+      const li = slot({ ...s, wonInRound: CHASE.seedRule === 'points' ? s.cups?.length > 0 : s.regWins > 0 }, meta);
+      if (s.cups?.length) {
+        li.title = `${s.cups.map(c => c.cup).join(' and ')} — a Finals place already secured`;
+      }
+      if (cutoff) li.classList.add('bubble-line');
+      ol.append(li);
+    });
+    col.append(ol, badge('Projected', grid.regular.length));
+    wrap.append(col);
+
+    /* A quiet note on who's first out, if the field is full. */
+    if (grid.regular.length >= CHASE.fieldSize) {
+      const note = el('div', 'proj-note');
+      note.textContent = CHASE.seedRule === 'points'
+        ? `The top ${CHASE.fieldSize} on points make the Finals. Winning the Sprint Cup or `
+          + `the Enduro Cup buys a place outright, and 25 points to open the first round.`
+        : 'Winners seed first, then points fill the field to 16. '
+          + 'A new race winner bumps the lowest driver in on points.';
+      wrap.append(note);
+    }
+    body.append(wrap);
+    return;
+  }
+
+  const wrap = el('div', 'chase');
+
+  const STAGGER = 58; /* two slots — see --stag in the stylesheet */
+
+  grid.rounds.forEach((round, i) => {
+    const col = el('div', 'round' + (round.complete ? '' : ' running'));
+    col.style.setProperty('--stag', i * STAGGER + 'px');
+    col.append(el('div', 'round-tracks', roundTracks(round.races)));
+
+    const ol = el('ol', 'ladder');
+    for (const e of round.entries) {
+      const meta = e.finale != null && e.finale < 99 ? 'P' + e.finale : e.points;
+      ol.append(slot({ ...e, champion: grid.champion?.id === e.id }, meta));
+    }
+    col.append(ol, badge(round.name, round.size));
+    wrap.append(col);
+  });
+
+  /* Where the trophy sits on the real board. */
+  const plate = el('div', 'plate');
+  const lastLadder = grid.rounds[grid.rounds.length - 1].entries.length;
+  plate.style.setProperty('--stag',
+    (grid.rounds.length - 1) * STAGGER + 23 + (lastLadder * 29 - 3) / 2 - 24 + 'px');
+  const champ = grid.champion;
+  plate.append(el('div', 'name' + (champ ? '' : ' tbd'), champ ? champ.driver.name : '—'));
+  plate.append(el('div', 'title chrome', CHASE.crown || 'Champion'));
+  wrap.append(plate);
+
+  body.append(wrap);
+}
+
+/* --- race modal --------------------------------------------------- */
+
+function driverOptions(select, selected, blank) {
+  select.replaceChildren();
+  select.append(new Option(blank, ''));
+  for (const d of season.drivers) {
+    const o = new Option(`${d.num ?? '–'}  ${d.name}`, d.id);
+    if (d.id === selected) o.selected = true;
+    select.append(o);
+  }
+}
+
+function showRace(r) {
+  openRace = r;
+  shots = [];
+  const race = season.schedule.find(x => x.r === r);
+
+  $('race-num').textContent = 'R' + r;
+  $('race-title').textContent = race.roundName || race.name;
+  const worth = race.mult && race.mult !== 1 ? ` · ${race.mult}\u00d7 points` : '';
+  $('race-track').textContent =
+    (race.round != null ? `${race.code} · Round ${race.round}` : race.code) + worth;
+  $('news-input').value = season.news[r] || '';
+  $('read-status').textContent = '';
+  $('read-status').className = 'status';
+  $('drop-label').textContent =
+    `Drop your ${series.screensLabel || series.label} results screenshots here, or click to browse`;
+
+  /* Qualifying is a thing in both series, so the pole field always
+     stands. The most-laps bonus is not — a series scoring it at 0 gets
+     the field taken away rather than left there scoring nothing. */
+  driverOptions($('pole-select'), season.poles[r], 'Not recorded');
+  const bonus = POINTS.bonusPerMostLaps || 0;
+  $('field-mostlaps').hidden = bonus === 0;
+  if (bonus) {
+    $('mostlaps-worth').textContent = `— ${bonus} bonus point${bonus === 1 ? '' : 's'}`;
+    driverOptions($('mostlaps-select'), season.mostLaps[r], 'Not recorded');
+  }
+
+  const existing = season.results[r] || {};
+  const order = Object.entries(existing)
+    .map(([id, res]) => ({ id, dnf: res === 'DNF', pos: res === 'DNF' ? null : res }))
+    .sort((a, b) => (a.pos ?? 99) - (b.pos ?? 99));
+
+  renderShots();
+  renderRows(order.length ? order : []);
+  $('race-modal').hidden = false;
+  $('pole-select').focus();
+}
+
+function renderRows(rows) {
+  const box = $('results-edit');
+  box.replaceChildren();
+  box._rows = rows;
+
+  if (!rows.length) {
+    const e = el('div', 'hint');
+    e.style.padding = '18px';
+    e.style.textAlign = 'center';
+    e.textContent = 'No finishing order yet. Read it off a screenshot, or add positions by hand.';
+    box.append(e);
+    return;
+  }
+
+  rows.forEach((row, i) => {
+    const div = el('div', 'res-row' + (i === 0 ? ' p1' : ''));
+    div.append(el('span', 'pos', String(i + 1)));
+
+    const sel = el('select');
+    driverOptions(sel, row.id, '— empty —');
+    sel.onchange = () => { row.id = sel.value; };
+    div.append(sel);
+
+    const dnf = el('button', 'dnf-tog', 'DNF');
+    dnf.type = 'button';
+    dnf.setAttribute('aria-pressed', String(!!row.dnf));
+    dnf.onclick = () => {
+      row.dnf = !row.dnf;
+      dnf.setAttribute('aria-pressed', String(row.dnf));
+    };
+    div.append(dnf);
+
+    const kill = el('button', 'kill', '×');
+    kill.type = 'button';
+    kill.title = 'Remove this position';
+    kill.setAttribute('aria-label', `Remove position ${i + 1}`);
+    kill.onclick = () => { rows.splice(i, 1); renderRows(rows); };
+    div.append(kill);
+
+    box.append(div);
+  });
+}
+
+const currentRows = () => $('results-edit')._rows || [];
+
+function renderShots() {
+  const box = $('shots');
+  box.replaceChildren();
+  shots.forEach((f, i) => {
+    const d = el('div', 'shot');
+    const img = el('img');
+    img.src = URL.createObjectURL(f);
+    img.alt = `Results screenshot ${i + 1}`;
+    const x = el('button', null, '×');
+    x.type = 'button';
+    x.setAttribute('aria-label', `Remove screenshot ${i + 1}`);
+    x.onclick = () => { shots.splice(i, 1); renderShots(); };
+    d.append(img, x);
+    box.append(d);
+  });
+}
+
+function saveRace() {
+  const r = openRace;
+  const rows = currentRows();
+  const out = {};
+  const seen = new Set();
+
+  rows.forEach((row, i) => {
+    if (!row.id || seen.has(row.id)) return;
+    seen.add(row.id);
+    out[row.id] = row.dnf ? 'DNF' : i + 1;
+  });
+
+  if (Object.keys(out).length) season.results[r] = out;
+  else delete season.results[r];
+
+  const pole = $('pole-select').value;
+  pole ? season.poles[r] = pole : delete season.poles[r];
+
+  /* Don't let a hidden field silently wipe a value the series can't show. */
+  if (!$('field-mostlaps').hidden) {
+    const most = $('mostlaps-select').value;
+    most ? season.mostLaps[r] = most : delete season.mostLaps[r];
+  }
+
+  const news = $('news-input').value.trim();
+  news ? season.news[r] = news : delete season.news[r];
+
+  $('race-modal').hidden = true;
+  persist();
+  toast(`Race ${r} saved`);
+}
+
+/* --- reading screenshots ------------------------------------------ */
+
+async function doRead() {
+  const btn = $('btn-read');
+  const status = $('read-status');
+  btn.disabled = true;
+  status.className = 'status busy';
+  status.textContent = 'Reading…';
+
+  try {
+    const raw = await readResults(shots, series.visionPrompt);
+    const rows = [];
+    let missed = 0;
+
+    for (const row of raw) {
+      const d = matchDriver(row, season.drivers);
+      if (!d) { missed++; continue; }
+      if (rows.some(x => x.id === d.id)) continue;
+      rows.push({ id: d.id, dnf: !!row.dnf });
+    }
+
+    renderRows(rows);
+    status.className = 'status ok';
+    status.textContent = `${rows.length} placed` + (missed ? ` · ${missed} unmatched, add them by hand` : '');
+  } catch (err) {
+    status.className = 'status err';
+    status.textContent = err.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* ------------------------------------------------------------------
+   Season editor — add years, change the field, redraw the calendar,
+   for either series, without touching the data block by hand.
+
+   Everything here works on a CLONE. Nothing reaches `season` until
+   Save, so Cancel really cancels and a half-finished edit can't leave
+   the roster and the results disagreeing.
+------------------------------------------------------------------ */
+
+let sq = null;   /* the working copy while the editor is open */
+
+/* A fingerprint of the working copy as it was opened, so leaving the
+   editor can tell whether there is anything to lose. */
+const sqPrint = () => JSON.stringify([sq.drivers, sq.schedule]);
+const sqDirty = () => !!sq && sqPrint() !== sq.clean;
+
+/* A driver's id keys their results, so it is minted once and then left
+   alone — renaming "Ky. Busch" to "Kyle Busch" must not orphan a season
+   of finishes. Only brand-new drivers get an id, and it is made unique
+   against the roster it is joining. */
+function mintId(name, taken) {
+  const base = norm(name) || 'driver';
+  let id = base, n = 2;
+  while (taken.has(id)) id = `${base}${n++}`;
+  return id;
+}
+
+function openSeasonEditor() {
+  sq = {
+    drivers: structuredClone(season.drivers),
+    schedule: structuredClone(season.schedule).map(r => ({ ...r, _orig: r.r })),
+  };
+  sq.clean = sqPrint();
+  $('sq-title').textContent = 'Edit season';
+  $('sq-sub').textContent = `${series.label} · ${year}`;
+  $('sq-status').textContent = '';
+  $('sq-delete').disabled = YEARS.length <= 1;
+  $('sq-delete').title = YEARS.length <= 1 ? "A series has to keep one season." : '';
+  sqTab('field');
+  sqDrivers();
+  sqRaces();
+  sqYears();
+  $('season-modal').hidden = false;
+}
+
+function sqTab(which) {
+  for (const [name, tab, panel] of [
+    ['field', 'sq-tab-field', 'sq-field'],
+    ['cal', 'sq-tab-cal', 'sq-cal'],
+    ['years', 'sq-tab-years', 'sq-years'],
+  ]) {
+    const on = name === which;
+    $(tab).setAttribute('aria-selected', String(on));
+    $(panel).hidden = !on;
+  }
+}
+
+/* --- the field ---------------------------------------------------- */
+
+function sqDrivers() {
+  const box = $('sq-drivers');
+  box.replaceChildren();
+
+  if (!sq.drivers.length) {
+    box.append(el('div', 'ed-empty', 'No drivers yet. Add one below.'));
+    return;
+  }
+
+  sq.drivers.forEach((d, i) => {
+    const row = el('div', 'ed-row ed-driver');
+
+    const num = el('input');
+    num.type = 'text';
+    num.value = d.num ?? '';
+    num.inputMode = 'numeric';
+    num.setAttribute('aria-label', `Car number, row ${i + 1}`);
+    num.oninput = () => { const n = parseInt(num.value, 10); d.num = Number.isFinite(n) ? n : null; };
+
+    const name = el('input');
+    name.type = 'text';
+    name.value = d.name || '';
+    name.setAttribute('aria-label', `Driver name, row ${i + 1}`);
+    name.oninput = () => { d.name = name.value; };
+
+    const poles = el('input');
+    poles.type = 'text';
+    poles.value = d.legacyPoles || 0;
+    poles.inputMode = 'numeric';
+    poles.setAttribute('aria-label', `Carried-over poles, row ${i + 1}`);
+    poles.oninput = () => { d.legacyPoles = parseInt(poles.value, 10) || 0; };
+
+    const bonus = el('input');
+    bonus.type = 'text';
+    bonus.value = d.legacyBonus || 0;
+    bonus.inputMode = 'numeric';
+    bonus.setAttribute('aria-label', `Carried-over bonus, row ${i + 1}`);
+    bonus.oninput = () => { d.legacyBonus = parseInt(bonus.value, 10) || 0; };
+
+    const kill = el('button', 'kill', '×');
+    kill.type = 'button';
+    kill.title = `Remove ${d.name || 'this driver'}`;
+    kill.setAttribute('aria-label', `Remove ${d.name || 'driver'} ${i + 1}`);
+    kill.onclick = () => {
+      const runs = countResults(d.id);
+      if (runs && !confirm(`${d.name || 'That driver'} has results in ${runs} `
+        + `${runs === 1 ? 'race' : 'races'}. Removing them drops those results. Continue?`)) return;
+      sq.drivers.splice(i, 1);
+      sqDrivers();
+    };
+
+    row.append(num, name, poles, bonus, kill);
+    box.append(row);
+  });
+}
+
+const countResults = id => Object.values(season.results).filter(r => r[id] != null).length;
+
+/* --- the calendar ------------------------------------------------- */
+
+function sqRaces() {
+  const box = $('sq-races');
+  box.replaceChildren();
+
+  if (!sq.schedule.length) {
+    box.append(el('div', 'ed-empty', 'No races yet. Add one below.'));
+    return;
+  }
+
+  sq.schedule.forEach((race, i) => {
+    const row = el('div', 'ed-row ed-race');
+    row.append(el('span', 'rnum', String(i + 1)));
+
+    const mk = (key, label, width, parse) => {
+      const inp = el('input');
+      inp.type = 'text';
+      inp.value = race[key] ?? '';
+      inp.setAttribute('aria-label', `${label}, race ${i + 1}`);
+      inp.oninput = () => { race[key] = parse ? parse(inp.value) : inp.value; };
+      return inp;
+    };
+    const num = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : null; };
+
+    row.append(
+      mk('code', 'Track code'),
+      mk('name', 'Race name'),
+      mk('round', 'Round number', null, num),
+      mk('roundName', 'Round name'),
+      mk('mult', 'Points multiplier', null, num),
+    );
+
+    const kill = el('button', 'kill', '×');
+    kill.type = 'button';
+    kill.title = `Remove ${race.name || 'this race'}`;
+    kill.setAttribute('aria-label', `Remove race ${i + 1}`);
+    kill.onclick = () => {
+      const runs = race._orig != null && raceRun(season, race._orig);
+      if (runs && !confirm(`${race.name || `Race ${i + 1}`} has a result recorded. `
+        + `Removing it drops that result. Continue?`)) return;
+      sq.schedule.splice(i, 1);
+      sqRaces();
+    };
+    row.append(kill);
+    box.append(row);
+  });
+}
+
+/* --- the list of years -------------------------------------------- */
+
+function sqYears() {
+  const box = $('sq-years-list');
+  box.replaceChildren();
+
+  for (const y of YEARS) {
+    const se = series.seasons[y];
+    const row = el('div', 'ed-row ed-year' + (y === year ? ' current' : ''));
+    const label = el('div', 'yr', y);
+    const run = se.schedule.filter(r => raceRun(se, r.r)).length;
+    label.append(el('small', null,
+      `${se.schedule.length} races · ${se.drivers.length} cars · ${run} run`));
+    row.append(label);
+
+    const open = el('button', 'btn small ghost', y === year ? 'Open' : 'Switch to');
+    open.type = 'button';
+    open.disabled = y === year;
+    open.onclick = () => { if (!closeSeasonEditor()) return; useSeason(y); render(); };
+    row.append(open);
+
+    const kill = el('button', 'kill', '×');
+    kill.type = 'button';
+    kill.disabled = YEARS.length <= 1;
+    kill.title = YEARS.length <= 1 ? 'A series has to keep one season.' : `Delete ${y}`;
+    kill.setAttribute('aria-label', `Delete season ${y}`);
+    kill.onclick = () => deleteSeason(y);
+    row.append(kill);
+
+    box.append(row);
+  }
+
+  const from = $('sq-new-from');
+  from.replaceChildren();
+  for (const y of YEARS) from.append(new Option(`Copy ${series.label} ${y}`, y));
+  from.append(new Option('Empty season', ''));
+  from.value = year;
+}
+
+function deleteSeason(y) {
+  if (YEARS.length <= 1) return;
+  const se = series.seasons[y];
+  const run = se.schedule.filter(r => raceRun(se, r.r)).length;
+  if (!confirm(`Delete ${series.label} ${y}?`
+    + (run ? ` It has ${run} ${run === 1 ? 'race' : 'races'} of results.` : '')
+    + `\n\nThis only changes this browser until you Commit.`)) return;
+
+  delete series.seasons[y];
+  YEARS = Object.keys(series.seasons).sort().reverse();
+  saveLocal(data);
+
+  if (y === year) {
+    /* The season the editor was editing just went; drop the working
+       copy rather than let Save write it onto a different year. */
+    closeSeasonEditor(true);
+    useSeason(YEARS[0]);
+  } else if (sq) {
+    sqYears();
+  }
+  render();
+  toast(`${series.label} ${y} deleted`);
+}
+
+function newSeason() {
+  const status = $('sq-status');
+  const y = $('sq-new-year').value.trim();
+  status.className = 'status err';
+
+  if (!/^\d{4}$/.test(y)) { status.textContent = 'Give the season a four-digit year.'; return; }
+  if (series.seasons[y]) { status.textContent = `${series.label} already has a ${y}.`; return; }
+
+  /* Creating a season leaves the editor, so the same warning applies. */
+  if (sqDirty() && !confirm('You have unsaved changes to the field or the calendar. '
+    + 'Creating a season discards them. Continue?')) { status.textContent = ''; return; }
+
+  const from = $('sq-new-from').value;
+  const src = from && series.seasons[from];
+
+  /* A copied season takes its own points and bracket so that editing
+     one year can never reach into another. */
+  const made = {
+    year: Number(y),
+    schedule: src ? structuredClone(src.schedule) : [],
+    drivers: src ? structuredClone(src.drivers) : [],
+    results: {}, poles: {}, mostLaps: {}, news: {},
+    points: structuredClone(src?.points || series.points),
+    chase: structuredClone(src?.chase ?? series.chase ?? null),
+  };
+
+  series.seasons[y] = made;
+  YEARS = Object.keys(series.seasons).sort().reverse();
+  saveLocal(data);
+
+  $('sq-new-year').value = '';
+  closeSeasonEditor(true);
+  useSeason(y);
+  render();
+  toast(`${series.label} ${y} created${src ? `, copied from ${from}` : ''}`);
+}
+
+/* --- committing the edit ------------------------------------------ */
+
+function saveSeasonEdit() {
+  const status = $('sq-status');
+  status.className = 'status err';
+
+  const drivers = sq.drivers.filter(d => (d.name || '').trim() || d.num != null);
+  if (!drivers.length) { status.textContent = 'A season needs at least one driver.'; return; }
+
+  /* Mint ids for new drivers only; existing ids ride through a rename. */
+  const taken = new Set(drivers.map(d => d.id).filter(Boolean));
+  for (const d of drivers) {
+    d.name = (d.name || '').trim();
+    if (!d.id) { d.id = mintId(d.name, taken); taken.add(d.id); }
+  }
+
+  /* Races renumber from the top. Anything keyed by race number travels
+     with them; a deleted race takes its own results with it. */
+  const remap = {};
+  sq.schedule.forEach((race, i) => {
+    race.r = i + 1;
+    if (race._orig != null) remap[race._orig] = race.r;
+  });
+  const move = obj => {
+    const out = {};
+    for (const [k, v] of Object.entries(obj || {})) {
+      const to = remap[k];
+      if (to != null) out[to] = v;
+    }
+    return out;
+  };
+
+  season.results = move(season.results);
+  season.poles = move(season.poles);
+  season.mostLaps = move(season.mostLaps);
+  season.news = move(season.news);
+
+  /* Drop results belonging to drivers who just left the roster. */
+  const live = new Set(drivers.map(d => d.id));
+  for (const r of Object.keys(season.results)) {
+    for (const id of Object.keys(season.results[r])) if (!live.has(id)) delete season.results[r][id];
+    if (!Object.keys(season.results[r]).length) delete season.results[r];
+  }
+  for (const key of ['poles', 'mostLaps']) {
+    for (const r of Object.keys(season[key])) if (!live.has(season[key][r])) delete season[key][r];
+  }
+
+  season.drivers = drivers;
+  season.schedule = sq.schedule.map(({ _orig, ...race }) => {
+    for (const k of ['round', 'roundName', 'mult']) {
+      if (race[k] == null || race[k] === '' || (k === 'mult' && race[k] === 1)) delete race[k];
+    }
+    race.code = (race.code || '').trim() || `R${race.r}`;
+    race.name = (race.name || '').trim() || race.code;
+    return race;
+  });
+
+  closeSeasonEditor(true);
+  persist();
+  toast(`${series.label} ${year} updated`);
+}
+
+/* Leaving with edits still in the working copy throws them away, so
+   say so first. `force` is for the paths that have already committed
+   them, or that the user has just confirmed. */
+function closeSeasonEditor(force = false) {
+  if (!force && sqDirty()
+    && !confirm('You have unsaved changes to the field or the calendar. Discard them?')) return false;
+  $('season-modal').hidden = true;
+  sq = null;
+  return true;
+}
+
+/* A bracket is configured in race numbers, so a redrawn calendar can
+   leave it pointing at races that no longer exist. Say so rather than
+   quietly scoring a season against a bracket that cannot run. */
+function chaseGaps(season) {
+  if (!CHASE) return [];
+  const have = new Set(season.schedule.map(r => r.r));
+  const want = new Set([CHASE.cutoffRace]);
+  for (const round of CHASE.rounds || []) for (const r of round.races) want.add(r);
+  for (const cup of CHASE.cups || []) { want.add(cup.from); want.add(cup.to); }
+  return [...want].filter(r => !have.has(r)).sort((a, b) => a - b);
+}
+
+/* --- settings ----------------------------------------------------- */
+
+function showSettings() {
+  const gh = getGitHub();
+  $('api-key').value = getApiKey();
+  $('gh-owner').value = gh.owner || '';
+  $('gh-repo').value = gh.repo || '';
+  $('gh-branch').value = gh.branch || 'main';
+  $('gh-token').value = gh.token || '';
+  $('settings-status').textContent = '';
+  $('settings-modal').hidden = false;
+}
+
+function saveSettings() {
+  setApiKey($('api-key').value.trim());
+  setGitHub({
+    owner: $('gh-owner').value.trim(),
+    repo: $('gh-repo').value.trim(),
+    branch: $('gh-branch').value.trim() || 'main',
+    token: $('gh-token').value.trim(),
+  });
+  $('settings-modal').hidden = true;
+  toast('Settings saved');
+}
+
+async function doCommit() {
+  const btn = $('btn-commit');
+  btn.disabled = true;
+  try {
+    const sha = await commitSeasons(data, seriesKey, year);
+    toast(`Committed ${sha}`);
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* --- render + wiring ---------------------------------------------- */
+
+/* Rebuilt on every series switch — the year list belongs to the series. */
+function renderSeasonPicker() {
+  const sel = $('season-select');
+  sel.replaceChildren();
+  for (const y of YEARS) sel.append(new Option(y, y));
+  sel.value = year;
+  sel.onchange = () => { useSeason(sel.value); render(); };
+}
+
+/* Built from the data, so a third series is a data edit and nothing more. */
+function renderSeriesTabs() {
+  const box = $('series-tabs');
+  if (box.children.length) return;   /* built once; selection is applySeriesChrome's job */
+
+  SERIES_KEYS.forEach(key => {
+    const btn = el('button', 'series-tab', data[key].label);
+    btn.type = 'button';
+    btn.id = 'series-' + key;
+    btn.dataset.series = key;
+    btn.setAttribute('role', 'tab');
+    btn.setAttribute('aria-controls', 'series-panel');
+    btn.setAttribute('aria-selected', String(key === seriesKey));
+    btn.tabIndex = key === seriesKey ? 0 : -1;
+    btn.onclick = () => switchSeries(key);
+    box.append(btn);
+  });
+
+  /* Left/right walk the tablist, Home/End jump the ends — the same
+     keys the sub-tabs answer to. */
+  box.onkeydown = e => {
+    const keys = { ArrowLeft: -1, ArrowRight: 1 };
+    let i = SERIES_KEYS.indexOf(seriesKey);
+    if (e.key in keys) i = (i + keys[e.key] + SERIES_KEYS.length) % SERIES_KEYS.length;
+    else if (e.key === 'Home') i = 0;
+    else if (e.key === 'End') i = SERIES_KEYS.length - 1;
+    else return;
+    e.preventDefault();
+    switchSeries(SERIES_KEYS[i]);
+    $('series-' + SERIES_KEYS[i]).focus();
+  };
+}
+
+function switchSeries(key) {
+  if (key === seriesKey) return;
+  setSeries2(key);
+  render();
+}
+
+function render() {
+  renderSeriesTabs();
+  applySeriesChrome();
+  $('series-panel').setAttribute('aria-labelledby', 'series-' + seriesKey);
+  renderSeasonPicker();
+  renderStrip();
+  renderStandings();
+  renderChase();
+}
+
+function selectTab(which) {
+  const std = which === 'standings' || !CHASE;
+  $('tab-standings').setAttribute('aria-selected', String(std));
+  $('tab-chase').setAttribute('aria-selected', String(!std));
+  $('view-standings').hidden = !std;
+  $('view-chase').hidden = std;
+}
+
+$('tab-standings').onclick = () => selectTab('standings');
+$('tab-chase').onclick = () => selectTab('chase');
+
+$('btn-done').onclick = saveRace;
+$('btn-cancel').onclick = () => { $('race-modal').hidden = true; };
+$('btn-read').onclick = doRead;
+$('btn-add-row').onclick = () => {
+  const rows = currentRows();
+  rows.push({ id: '', dnf: false });
+  renderRows(rows);
+};
+$('btn-clear-race').onclick = () => {
+  delete season.results[openRace];
+  delete season.poles[openRace];
+  delete season.mostLaps[openRace];
+  delete season.news[openRace];
+  $('race-modal').hidden = true;
+  persist();
+  toast(`Race ${openRace} cleared`);
+};
+
+$('shots-input').onchange = e => {
+  shots.push(...e.target.files);
+  renderShots();
+  e.target.value = '';
+};
+const drop = $('drop');
+['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, e => {
+  e.preventDefault(); drop.classList.add('over');
+}));
+['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => {
+  e.preventDefault(); drop.classList.remove('over');
+}));
+drop.addEventListener('drop', e => {
+  shots.push(...[...e.dataTransfer.files].filter(f => f.type.startsWith('image/')));
+  renderShots();
+});
+
+$('btn-season').onclick = openSeasonEditor;
+$('sq-cancel').onclick = () => closeSeasonEditor();
+$('sq-save').onclick = saveSeasonEdit;
+$('sq-delete').onclick = () => deleteSeason(year);
+$('sq-new-go').onclick = newSeason;
+$('sq-add-driver').onclick = () => { sq.drivers.push({ num: null, name: '', legacyPoles: 0, legacyBonus: 0 }); sqDrivers(); };
+$('sq-add-race').onclick = () => { sq.schedule.push({ r: sq.schedule.length + 1, code: '', name: '' }); sqRaces(); };
+$('sq-tab-field').onclick = () => sqTab('field');
+$('sq-tab-cal').onclick = () => sqTab('cal');
+$('sq-tab-years').onclick = () => sqTab('years');
+$('sq-new-year').onkeydown = e => { if (e.key === 'Enter') newSeason(); };
+
+$('btn-settings').onclick = showSettings;
+$('btn-settings-save').onclick = saveSettings;
+$('btn-settings-close').onclick = () => { $('settings-modal').hidden = true; };
+$('btn-commit').onclick = doCommit;
+$('btn-export').onclick = () => downloadSeason(season);
+$('btn-import').onclick = () => $('import-input').click();
+$('import-input').onchange = async e => {
+  try {
+    const loaded = await importSeason(e.target.files[0]);
+    if (!loaded?.schedule || !loaded?.drivers) throw new Error("That file isn't a season.");
+    /* Land it on its own year if it names one, and put it back into the
+       series so persist() actually saves it. */
+    const into = String(loaded.year || year);
+    series.seasons[into] = loaded;
+    YEARS = Object.keys(series.seasons).sort().reverse();
+    useSeason(into);
+    renderSeasonPicker();
+    persist();
+    $('settings-modal').hidden = true;
+    toast(`${series.label} ${into} loaded`);
+  } catch (err) { toast(err.message, true); }
+  finally { e.target.value = ''; }
+};
+$('btn-reset').onclick = () => {
+  if (!SEED[seriesKey]?.seasons[year]) {
+    toast(`${year} isn't in the committed copy — nothing to reset to.`, true);
+    return;
+  }
+  if (!confirm(`This drops every ${series.label} ${year} change saved in this browser `
+    + `and reloads the committed copy. Continue?`)) return;
+  data = resetSeason(data, SEED, seriesKey, year);
+  series = data[seriesKey];
+  useSeason(year);
+  persist();
+  toast(`${series.label} ${year} reset to the committed copy`);
+};
+
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  $('race-modal').hidden = true;
+  $('settings-modal').hidden = true;
+  if (!$('season-modal').hidden) closeSeasonEditor();
+});
+
+[$('race-modal'), $('settings-modal')].forEach(m => {
+  m.addEventListener('mousedown', e => { if (e.target === m) m.hidden = true; });
+});
+$('season-modal').addEventListener('mousedown', e => {
+  if (e.target === $('season-modal')) closeSeasonEditor();
+});
+
+/* ------------------------------------------------------------------
+   Boot — the session comes first.
+
+   Cloud-only means there is nothing to show before Supabase answers,
+   so the gate holds the page until it does. Everything after this
+   point is the app as it always was.
+------------------------------------------------------------------ */
+
+function boot() {
+  data = loadData(SEED);
+  SERIES_KEYS = Object.keys(data);
+  seriesKey = SERIES_KEYS.includes(getSeries()) ? getSeries() : SERIES_KEYS[0];
+  setSeries2(seriesKey, false);
+  render();
+  $('gate').hidden = true;
+  $('app-root').hidden = false;
+  setSync('Saved', 'ok');
+}
+
+const gateSay = (msg, cls) => {
+  const el = $('gate-status');
+  el.textContent = msg;
+  el.className = 'status' + (cls ? ' ' + cls : '');
+};
+const gateBusy = busy => { $('gate-in').disabled = busy; $('gate-up').disabled = busy; };
+
+function credentials() {
+  const email = $('gate-email').value.trim();
+  const password = $('gate-password').value;
+  if (!email || !password) { gateSay('Enter an email and password.', 'err'); return null; }
+  return { email, password };
+}
+
+$('gate-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const creds = credentials();
+  if (!creds) return;
+  gateBusy(true);
+  gateSay('Signing in…', 'busy');
+  const { error } = await sb.auth.signInWithPassword(creds);
+  gateBusy(false);
+  if (error) gateSay(error.message, 'err');
+  /* On success onAuthStateChange takes it from here. */
+});
+
+$('gate-up').onclick = async () => {
+  const creds = credentials();
+  if (!creds) return;
+  gateBusy(true);
+  gateSay('Creating account…', 'busy');
+  const { data: out, error } = await sb.auth.signUp({
+    ...creds,
+    options: { emailRedirectTo: location.origin + location.pathname },
+  });
+  gateBusy(false);
+  if (error) gateSay(error.message, 'err');
+  else if (out.session) gateSay('Account created.', 'ok');
+  else gateSay('Account created — confirm the email, then sign in.', 'ok');
+};
+
+$('btn-signout').onclick = async () => {
+  flushPending();
+  await sb.auth.signOut();
+  location.reload();
+};
+
+/* Resolves with the first session there is, whether it was already in
+   storage or the user has just typed their way to one. */
+function waitForSession() {
+  return new Promise(resolve => {
+    sb.auth.getSession().then(({ data: got }) => {
+      if (got.session) { resolve(got.session); return; }
+      const { data: sub } = sb.auth.onAuthStateChange((_e, session) => {
+        if (session) { sub.subscription.unsubscribe(); resolve(session); }
+      });
+    });
+  });
+}
+
+(async function start() {
+  if (!sb) {
+    gateSay("Couldn't load the Supabase library — check your connection and reload.", 'err');
+    gateBusy(true);
+    return;
+  }
+
+  const session = await waitForSession();
+  userId = session.user.id;
+  $('acct-email').textContent = session.user.email || session.user.id;
+
+  gateSay('Loading your seasons…', 'busy');
+  try {
+    await loadCloud(userId);
+  } catch (err) {
+    gateSay(`Couldn't reach your seasons: ${err.message}`, 'err');
+    return;
+  }
+
+  const from = migrateLocalToCloud();
+  boot();
+  if (from) toast(`Seasons moved up from ${from} — the local copy is still there as a backup.`);
+})();
+
+</script>
+</body>
+</html>
