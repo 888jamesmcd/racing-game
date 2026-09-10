@@ -189,8 +189,9 @@
   against the standard points table. Omitted means 1. Supercars' two
   enduros (The Bend r26, Bathurst r27) are `mult: 2`: one long race
   paying double. It applies to finishing points, DNF points, the chase
-  rounds and the cup slices alike, and it shows on the schedule chip,
-  the grid header and the race modal as "x2".
+  rounds and the cup slices alike. It is deliberately NOT drawn on the
+  schedule chip or the grid header — it lives in their tooltips, in the
+  race modal's header, and in Edit season > Calendar.
 
   It lives on the schedule, not in the points config, so re-weighting a
   race when the calendar changes is a data edit and nothing else — a
@@ -278,7 +279,8 @@
 
   --mono: 'IBM Plex Mono', ui-monospace, monospace;
   --cond: 'Barlow Semi Condensed', 'Barlow Condensed', 'Arial Narrow', sans-serif;
-  --cell: 30px;
+  --cell: 36px;
+  --stat-w: 36px;
   --skew: -11deg;
 }
 
@@ -311,7 +313,7 @@ body[data-series="supercars"] {
   --chrome-2: #e2231a;
   --chrome-3: #6d0e0a;
 
-  --cell: 28px;
+  --cell: 34px;
   --row-h: 24px;
   --skew: -4deg;
 }
@@ -446,13 +448,6 @@ tbody td.cell.round-start { border-left: 1px solid var(--line-soft); }
 .race-chip.done .rn { color: var(--accent); }
 .race-chip.next { border-color: var(--accent); }
 
-/* a race worth more than one race's points says so */
-.race-chip .mult, thead th.race-h .mult {
-  display: block; font-family: var(--mono); font-size: 8px;
-  font-style: normal; letter-spacing: .06em; color: var(--accent-lo);
-}
-.race-chip.done .mult { color: var(--accent); }
-
 /* --- standings ---------------------------------------------------- */
 
 .table-wrap {
@@ -511,7 +506,7 @@ tbody tr:hover .c-rank, tbody tr:hover .c-num, tbody tr:hover .c-driver { backgr
 
 .c-pts, .c-behind { position: sticky; z-index: 15; background: var(--panel); font-size: 12px; }
 .c-pts { right: var(--pin-pts, 62px); min-width: 56px; font-weight: 600; border-left: 1px solid var(--line); }
-.c-behind { right: 0; min-width: 62px; color: var(--muted); }
+.c-behind { right: 0; min-width: 54px; color: var(--muted); }
 thead .c-pts, thead .c-behind { z-index: 25; background: var(--head); }
 tbody tr:hover .c-pts, tbody tr:hover .c-behind { background: var(--raised); }
 .c-behind.leader {
@@ -528,9 +523,33 @@ tbody tr:hover .c-pts, tbody tr:hover .c-behind { background: var(--raised); }
 .cell.p-run { color: var(--dim); }
 .cell.empty { color: #26292b; }
 
-.stat { width: 42px; color: var(--muted); border-left: 1px solid var(--line-soft); }
+/* The season grid is the only thing that scrolls. Rank/#/Driver pin to
+   the left, and the stat block, Pts and Gap pin to the right, so the
+   numbers you read a row against never slide away from the races.
+   Offsets come from pinColumns() — the browser sizes these from their
+   content, so they have to be measured rather than assumed. */
+.stat {
+  position: sticky; z-index: 15; background: var(--panel);
+  width: var(--stat-w); min-width: var(--stat-w);
+  color: var(--muted); border-left: 1px solid var(--line-soft);
+}
+.stat.s0 { right: var(--pin-stat-0, auto); border-left: 1px solid var(--line); }
+.stat.s1 { right: var(--pin-stat-1, auto); }
+.stat.s2 { right: var(--pin-stat-2, auto); }
+.stat.s3 { right: var(--pin-stat-3, auto); }
+.stat.s4 { right: var(--pin-stat-4, auto); }
+.stat.s5 { right: var(--pin-stat-5, auto); }
+.stat.s6 { right: var(--pin-stat-6, auto); }
+thead .stat { z-index: 25; background: var(--head); }
+tbody tr:hover .stat { background: var(--raised); }
 .stat.wins { color: var(--accent); }
 .stat.zero { color: var(--dim); }
+
+/* Too narrow to pin nine columns and still see a race — let the stats
+   scroll with the grid again and keep Pts and Gap as the anchor. */
+@media (max-width: 1000px) {
+  .stat.s0, .stat.s1, .stat.s2, .stat.s3, .stat.s4, .stat.s5, .stat.s6 { right: auto; }
+}
 
 /* --- the chase grid ----------------------------------------------- */
 
@@ -1986,13 +2005,20 @@ function roundGroups(schedule) {
   return out;
 }
 
+/* "Gold Coast 500 — Gold Coast R2", or just "Bathurst 1000" when the
+   round is a single race and naming it twice would read as a stutter.
+   The points weighting rides along here rather than on the chip face. */
+function raceLabel(race) {
+  const name = race.roundName && race.roundName !== race.name
+    ? `${race.roundName} — ${race.name}` : race.name;
+  return name + (race.mult && race.mult !== 1 ? ` — ${race.mult}\u00d7 points` : '');
+}
+
 function raceChip(race, last) {
   const done = raceRun(season, race.r);
   const chip = el('button', 'race-chip' + (done ? ' done' : '') + (race.r === last + 1 ? ' next' : ''));
   chip.append(el('span', 'rn', 'R' + race.r), el('span', 'rc', race.code));
-  if (race.mult && race.mult !== 1) chip.append(el('span', 'mult', `\u00d7${race.mult}`));
-  const worth = race.mult && race.mult !== 1 ? ` — ${race.mult}\u00d7 points` : '';
-  chip.title = (race.roundName ? `${race.roundName} — ${race.name}` : race.name) + worth;
+  chip.title = raceLabel(race);
   chip.setAttribute('aria-label', `Race ${race.r}, ${race.name}`);
   chip.onclick = () => showRace(race.r);
   return chip;
@@ -2023,9 +2049,17 @@ function renderStrip() {
 
 /* --- standings ---------------------------------------------------- */
 
+/* Short label, the row key, and the long name for the tooltip. These
+   are pinned to the right now, so every character costs a race
+   column — hence PP rather than Poles. */
 const STAT_COLS = [
-  ['Starts', 'starts'], ['Wins', 'wins'], ['Top 5', 'top5'],
-  ['Top 10', 'top10'], ['DNF', 'dnfs'], ['Poles', 'poles'], ['Bonus', 'bonus'],
+  ['ST', 'starts', 'Starts'],
+  ['W', 'wins', 'Wins'],
+  ['T5', 'top5', 'Top 5 finishes'],
+  ['T10', 'top10', 'Top 10 finishes'],
+  ['DNF', 'dnfs', 'Did not finish'],
+  ['PP', 'poles', 'Poles'],
+  ['BON', 'bonus', 'Bonus points'],
 ];
 
 function cellClass(res) {
@@ -2051,14 +2085,16 @@ function renderStandings() {
   for (const race of season.schedule) {
     const h = el('th', 'race-h' + (roundStarts.has(race.r) ? ' round-start' : ''));
     h.append(el('span', 'rn', 'R' + race.r), document.createTextNode(race.code));
-    if (race.mult && race.mult !== 1) h.append(el('span', 'mult', `\u00d7${race.mult}`));
-    const worth = race.mult && race.mult !== 1 ? ` — ${race.mult}\u00d7 points` : '';
-    h.title = (race.roundName ? `${race.roundName} — ${race.name}` : race.name) + worth;
+    h.title = raceLabel(race);
     h.onclick = () => showRace(race.r);
     hr.append(h);
   }
-  for (const [label] of STAT_COLS) hr.append(th(label, 'stat'));
-  hr.append(th('Pts', 'c-pts'), th('Behind', 'c-behind'));
+  STAT_COLS.forEach(([label, , full], j) => {
+    const h = th(label, `stat s${j}`);
+    h.title = full;
+    hr.append(h);
+  });
+  hr.append(th('Pts', 'c-pts'), th('Gap', 'c-behind'));
   thead.append(hr);
 
   const tbody = el('tbody');
@@ -2081,10 +2117,12 @@ function renderStandings() {
       cell.style.cursor = 'pointer';
       tr.append(cell);
     }
-    for (const [label, key] of STAT_COLS) {
+    STAT_COLS.forEach(([, key], j) => {
       const v = row[key];
-      tr.append(td(v, 'stat' + (key === 'wins' && v > 0 ? ' wins' : '') + (v === 0 ? ' zero' : '')));
-    }
+      tr.append(td(v, `stat s${j}`
+        + (key === 'wins' && v > 0 ? ' wins' : '')
+        + (v === 0 ? ' zero' : '')));
+    });
     tr.append(td(row.points, 'c-pts'));
     tr.append(td(row.behind == null ? 'LEADER' : row.behind, 'c-behind' + (row.behind == null ? ' leader' : '')));
     tbody.append(tr);
@@ -2101,10 +2139,20 @@ function pinColumns(table) {
   const tr = table.querySelector('tbody tr');
   if (!tr) return;
   const w = cls => tr.querySelector('.' + cls)?.getBoundingClientRect().width || 0;
-  const rank = w('c-rank'), num = w('c-num'), behind = w('c-behind');
+  const rank = w('c-rank'), num = w('c-num'), behind = w('c-behind'), pts = w('c-pts');
   table.style.setProperty('--pin-num', rank + 'px');
   table.style.setProperty('--pin-driver', rank + num + 'px');
   table.style.setProperty('--pin-pts', behind + 'px');
+
+  /* The stat block stacks leftwards from Pts, so it has to be walked
+     right to left, each column sitting on the total width of the ones
+     already placed outside it. */
+  const stats = [...tr.querySelectorAll('.stat')];
+  let offset = behind + pts;
+  for (let j = stats.length - 1; j >= 0; j--) {
+    table.style.setProperty(`--pin-stat-${j}`, offset + 'px');
+    offset += stats[j].getBoundingClientRect().width;
+  }
 }
 
 const th = (t, c) => el('th', c, t);
