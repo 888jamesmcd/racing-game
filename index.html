@@ -143,10 +143,20 @@
               Removing a driver who has results asks first and then
               clears those results, their poles and their most-laps.
 
-    Calendar  add, edit or remove races, and set a race's round, round
-              name and points multiplier. Races renumber from the top
-              on Save, and results, poles, most-laps and notes all move
-              with them; a deleted race takes its own results with it.
+    Calendar  add, edit, remove and REORDER races, and set a race's
+              round, round name and points multiplier. Drag a row by
+              its handle, or focus a handle and use Up/Down/Home/End —
+              the handle is the only draggable part, so the inputs in
+              the row still take a text selection. Races renumber from
+              the top on Save, and results, poles, most-laps and notes
+              all move with them; a deleted race takes its own results
+              with it.
+
+              Reordering is the case chaseGaps() cannot see: every race
+              number the bracket names still exists, but a different
+              event is now sitting on it. saveSeasonEdit() compares the
+              bracket's races against the remap and warns when any of
+              them shifted.
 
     Seasons   list, switch, delete, and add a year — empty, or copied
               from an existing season. A copy brings the calendar and
@@ -675,14 +685,34 @@ tbody tr:hover .c-pts, tbody tr:hover .c-behind { background: var(--raised); }
   padding-bottom: 6px;
 }
 .ed-driver { grid-template-columns: 58px 1fr 62px 62px 26px; }
-.ed-race   { grid-template-columns: 34px 62px 1fr 40px 1fr 52px 26px; }
+.ed-race   { grid-template-columns: 22px 28px 62px 1fr 40px 1fr 52px 26px; }
 .ed-year   { grid-template-columns: 1fr auto auto; }
+
+/* drag handle — the row itself stays undraggable so the inputs inside
+   it still take a text selection */
+.grip {
+  background: none; border: 0; padding: 4px 0;
+  color: var(--dim); cursor: grab; font-size: 12px; line-height: 1;
+  text-align: center; letter-spacing: -1px;
+}
+.grip:hover { color: var(--muted); }
+.grip:active { cursor: grabbing; }
+.grip:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-radius: 2px; }
+.ed-row.dragging { opacity: .35; }
+.ed-row.drop-above { box-shadow: inset 0 2px 0 var(--accent); }
+.ed-row.drop-below { box-shadow: inset 0 -2px 0 var(--accent); }
+.ed-row.landed { background: var(--raised); }
+
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
 
 .ed-rows {
   max-height: 46vh; overflow-y: auto;
   border: 1px solid var(--line); border-radius: 2px;
 }
-.ed-row { border-bottom: 1px solid var(--line-soft); }
+.ed-row { border-bottom: 1px solid var(--line-soft); transition: background .3s; }
 .ed-row:last-child { border-bottom: 0; }
 .ed-row:hover { background: var(--raised); }
 .ed-row input, .ed-row select {
@@ -1039,11 +1069,13 @@ input:focus, select:focus, textarea:focus {
       </section>
 
       <section id="sq-cal" role="tabpanel" aria-labelledby="sq-tab-cal" hidden>
-        <div class="ed-head ed-race"><span>R</span><span>Code</span><span>Race</span><span>Rnd</span><span>Round name</span><span>×Pts</span><span></span></div>
+        <div class="ed-head ed-race"><span></span><span>R</span><span>Code</span><span>Race</span><span>Rnd</span><span>Round name</span><span>×Pts</span><span></span></div>
         <div class="ed-rows" id="sq-races"></div>
         <button class="btn small ghost" id="sq-add-race" style="margin-top:8px">Add a race</button>
-        <p class="hint">Races renumber from the top when you save, and results, poles and notes move with them.
+        <p class="hint">Drag a row by its handle to reorder, or focus a handle and use the arrow keys.
+          Races renumber from the top when you save, and results, poles and notes move with them.
           ×Pts is what the race is worth against the points table — blank or 1 is normal, 2 is an enduro.</p>
+        <p class="sr-only" id="sq-live" role="status" aria-live="polite"></p>
       </section>
 
       <section id="sq-years" role="tabpanel" aria-labelledby="sq-tab-years" hidden>
@@ -2509,6 +2541,27 @@ const countResults = id => Object.values(season.results).filter(r => r[id] != nu
 
 /* --- the calendar ------------------------------------------------- */
 
+/* Move a race to a new slot in the running order and redraw. `to` is
+   the index it should end up at once it has been lifted out. Results
+   are keyed by race number and the save remaps them from _orig, so a
+   race carries its result with it wherever it lands. */
+function moveRace(from, to) {
+  to = Math.max(0, Math.min(sq.schedule.length - 1, to));
+  if (from === to) return from;
+  const [race] = sq.schedule.splice(from, 1);
+  sq.schedule.splice(to, 0, race);
+  sqRaces();
+  const moved = $('sq-races').children[to];
+  if (moved) {
+    moved.classList.add('landed');
+    setTimeout(() => moved.classList.remove('landed'), 450);
+  }
+  $('sq-live').textContent = `${race.name || 'Race'} moved to position ${to + 1} of ${sq.schedule.length}.`;
+  return to;
+}
+
+let dragFrom = null;
+
 function sqRaces() {
   const box = $('sq-races');
   box.replaceChildren();
@@ -2518,9 +2571,67 @@ function sqRaces() {
     return;
   }
 
+  const clearMarks = () => {
+    for (const r of box.children) r.classList.remove('drop-above', 'drop-below');
+  };
+
   sq.schedule.forEach((race, i) => {
     const row = el('div', 'ed-row ed-race');
-    row.append(el('span', 'rnum', String(i + 1)));
+
+    /* Only the handle is draggable. Making the whole row draggable
+       stops you selecting text inside its inputs. */
+    const grip = el('button', 'grip', '⠿');
+    grip.type = 'button';
+    grip.draggable = true;
+    grip.title = 'Drag to reorder, or use the arrow keys';
+    grip.setAttribute('aria-label',
+      `Reorder ${race.name || 'race'}, position ${i + 1} of ${sq.schedule.length}. Arrow keys to move.`);
+
+    grip.ondragstart = e => {
+      dragFrom = i;
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', String(i));   /* Firefox needs a payload */
+      e.dataTransfer.setDragImage(row, 12, 12);
+      row.classList.add('dragging');
+    };
+    grip.ondragend = () => { dragFrom = null; clearMarks(); row.classList.remove('dragging'); };
+
+    grip.onkeydown = e => {
+      const step = e.key === 'ArrowUp' ? -1 : e.key === 'ArrowDown' ? 1 : 0;
+      if (!step && e.key !== 'Home' && e.key !== 'End') return;
+      e.preventDefault();
+      const to = e.key === 'Home' ? 0
+        : e.key === 'End' ? sq.schedule.length - 1
+        : i + step;
+      const landed = moveRace(i, to);
+      $('sq-races').children[landed]?.querySelector('.grip')?.focus();
+    };
+
+    row.ondragover = e => {
+      if (dragFrom === null) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      const box2 = row.getBoundingClientRect();
+      const above = e.clientY < box2.top + box2.height / 2;
+      clearMarks();
+      if (i !== dragFrom) row.classList.add(above ? 'drop-above' : 'drop-below');
+    };
+    row.ondragleave = () => row.classList.remove('drop-above', 'drop-below');
+    row.ondrop = e => {
+      if (dragFrom === null) return;
+      e.preventDefault();
+      const rect = row.getBoundingClientRect();
+      const above = e.clientY < rect.top + rect.height / 2;
+      /* Where it should sit once it has been lifted out of the list. */
+      let to = above ? i : i + 1;
+      if (to > dragFrom) to -= 1;
+      const from = dragFrom;
+      dragFrom = null;
+      clearMarks();
+      moveRace(from, to);
+    };
+
+    row.append(grip, el('span', 'rnum', String(i + 1)));
 
     const mk = (key, label, width, parse) => {
       const inp = el('input');
@@ -2703,6 +2814,11 @@ function saveSeasonEdit() {
     for (const r of Object.keys(season[key])) if (!live.has(season[key][r])) delete season[key][r];
   }
 
+  /* chaseGaps() catches a bracket pointing at a race that no longer
+     exists. A reorder is sneakier: every number the bracket names still
+     exists, but a different event is sitting on it now. Say so. */
+  const shifted = chaseRefs().filter(n => remap[n] != null && remap[n] !== n);
+
   season.drivers = drivers;
   season.schedule = sq.schedule.map(({ _orig, ...race }) => {
     for (const k of ['round', 'roundName', 'mult']) {
@@ -2715,7 +2831,13 @@ function saveSeasonEdit() {
 
   closeSeasonEditor(true);
   persist();
-  toast(`${series.label} ${year} updated`);
+
+  if (shifted.length) {
+    toast(`${series.label} ${year} updated — but the running order moved under the bracket. `
+      + `Check it still names the races you mean.`, true);
+  } else {
+    toast(`${series.label} ${year} updated`);
+  }
 }
 
 /* Leaving with edits still in the working copy throws them away, so
@@ -2732,13 +2854,19 @@ function closeSeasonEditor(force = false) {
 /* A bracket is configured in race numbers, so a redrawn calendar can
    leave it pointing at races that no longer exist. Say so rather than
    quietly scoring a season against a bracket that cannot run. */
+/* Every race number the active bracket depends on. */
+function chaseRefs() {
+  if (!CHASE) return [];
+  const want = new Set([CHASE.cutoffRace]);
+  for (const round of CHASE.rounds || []) for (const r of round.races) want.add(r);
+  for (const cup of CHASE.cups || []) for (let r = cup.from; r <= cup.to; r++) want.add(r);
+  return [...want].sort((a, b) => a - b);
+}
+
 function chaseGaps(season) {
   if (!CHASE) return [];
   const have = new Set(season.schedule.map(r => r.r));
-  const want = new Set([CHASE.cutoffRace]);
-  for (const round of CHASE.rounds || []) for (const r of round.races) want.add(r);
-  for (const cup of CHASE.cups || []) { want.add(cup.from); want.add(cup.to); }
-  return [...want].filter(r => !have.has(r)).sort((a, b) => a - b);
+  return chaseRefs().filter(r => !have.has(r));
 }
 
 /* --- settings ----------------------------------------------------- */
